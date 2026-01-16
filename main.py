@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v2.3.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v2.4.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -9,12 +9,17 @@ AstrBot 上下文场景感知增强插件 v2.3.0 (Context-Aware Enhancement)
 - 对话对象推断: 谁在和谁说话（关键功能）
 - 对话流分析: 最近的对话结构
 - Bot 状态追踪: 上次发言时间和内容
+- 图像转述: 将群友发送的图片转为文字描述（可选）
 
 设计原则:
-- 纯规则分析，零额外 LLM 调用
 - 只做加法，不修改框架原有信息
-- 与框架 LongTermMemory 协作而非冲突
-- 轻量高效，不影响响应速度
+- 可完全替代框架内置 LTM 的群聊记录功能
+- 轻量高效，图像转述为可选功能
+
+v2.4.0 更新:
+- 新增图像转述功能：可将群友发送的图片转为文字描述
+- 支持自定义图像转述提供商和提示词
+- 完善文档：明确说明需关闭框架内置 LTM 以避免重复
 
 v2.3.0 更新:
 - 修复回复词推断误判：现在只有当 Bot 之前确实在回复当前用户时，才会推断用户在回复 Bot
@@ -23,7 +28,7 @@ v2.3.0 更新:
 - 收紧上下文推断条件：减少误判风险
 
 Author: 木有知
-Version: 2.3.0
+Version: 2.4.0
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ from astrbot import logger
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, Image, Plain, Reply
-from astrbot.api.provider import LLMResponse, ProviderRequest
+from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
 
 if TYPE_CHECKING:
@@ -530,7 +535,7 @@ class Main(star.Star):
     通过分析群聊消息结构，为 LLM 提供结构化的场景描述，
     帮助 Bot 更好地理解对话情境并做出恰当回应。
 
-    v2.2 更新：增强日志输出，让用户能清晰看到插件工作状态。
+    v2.4.0 更新：新增图像转述功能，可完全替代框架内置 LTM。
     """
 
     def __init__(
@@ -540,9 +545,17 @@ class Main(star.Star):
     ) -> None:
         super().__init__(context)
         self._config = config
+        self._context = context  # 保存 context 用于获取 provider
 
         self._enabled = bool(self._cfg("enable", True))
         self._group_only = bool(self._cfg("only_group_chat", True))
+
+        # 图像转述配置
+        self._image_caption_enabled = bool(self._cfg("image_caption", False))
+        self._image_caption_provider_id = str(self._cfg("image_caption_provider_id", "") or "")
+        self._image_caption_prompt = str(
+            self._cfg("image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。") or ""
+        )
 
         self._sessions = SessionManager(
             max_messages=int(self._cfg("max_history", 50) or 50),
@@ -554,7 +567,13 @@ class Main(star.Star):
         self._bot_id: str | None = None
         self._analyzer: SceneAnalyzer | None = None
 
-        logger.info("[ContextAware] 插件 v2.3.0 已加载，增强日志已启用")
+        # 图像转述统计
+        self._image_caption_count = 0
+        self._image_caption_errors = 0
+
+        version = "2.4.0"
+        caption_status = "已启用" if self._image_caption_enabled else "未启用"
+        logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
@@ -589,6 +608,101 @@ class Main(star.Star):
         logger.info(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
         return True
 
+    async def _get_image_caption(self, image_url: str) -> str | None:
+        """获取图片描述"""
+        if not self._image_caption_enabled:
+            return None
+
+        try:
+            # 获取 provider
+            provider = None
+            if self._image_caption_provider_id:
+                provider = self._context.get_provider_by_id(self._image_caption_provider_id)
+                if not provider:
+                    logger.warning(
+                        f"[ContextAware] 找不到指定的图像转述提供商: {self._image_caption_provider_id}"
+                    )
+                    return None
+            else:
+                provider = self._context.get_using_provider()
+
+            if not provider or not isinstance(provider, Provider):
+                logger.warning("[ContextAware] 无法获取有效的 Provider 进行图像转述")
+                return None
+
+            # 调用 LLM 获取图片描述
+            response = await provider.text_chat(
+                prompt=self._image_caption_prompt,
+                image_urls=[image_url],
+            )
+
+            if response and response.completion_text:
+                self._image_caption_count += 1
+                caption = response.completion_text.strip()
+                # 限制长度
+                if len(caption) > 100:
+                    caption = caption[:97] + "..."
+                logger.debug(f"[ContextAware] 图像转述成功: {caption[:30]}...")
+                return caption
+
+        except Exception as e:
+            self._image_caption_errors += 1
+            logger.error(f"[ContextAware] 图像转述失败: {e}")
+
+        return None
+
+    async def _extract_message_with_caption(
+        self, event: AstrMessageEvent
+    ) -> MessageRecord:
+        """从事件提取消息记录，支持图像转述"""
+        assert self._analyzer is not None
+
+        sender_id = event.get_sender_id()
+        parts: list[str] = []
+
+        # 提取消息内容
+        for comp in event.get_messages():
+            if isinstance(comp, Plain) and comp.text:
+                parts.append(comp.text)
+            elif isinstance(comp, Image):
+                # 尝试图像转述
+                if self._image_caption_enabled:
+                    image_url = comp.url if comp.url else comp.file
+                    if image_url:
+                        caption = await self._get_image_caption(image_url)
+                        if caption:
+                            parts.append(f"[图片: {caption}]")
+                        else:
+                            parts.append("[图片]")
+                    else:
+                        parts.append("[图片]")
+                else:
+                    parts.append("[图片]")
+
+        content = "".join(parts) if parts else (event.message_str or "[消息]")
+
+        msg = MessageRecord(
+            msg_id=str(event.message_obj.message_id),
+            sender_id=sender_id,
+            sender_name=event.get_sender_name() or sender_id,
+            content=content[:500],
+            timestamp=time.time(),
+            is_bot=(sender_id == self._analyzer._bot_id),
+        )
+
+        # 提取 @ 和回复信息
+        for comp in event.get_messages():
+            if isinstance(comp, At):
+                qq_str = str(comp.qq)
+                msg.at_targets.append((qq_str, comp.name or qq_str))
+                if qq_str == self._analyzer._bot_id:
+                    msg.at_bot = True
+            elif isinstance(comp, Reply):
+                if comp.sender_id:
+                    msg.reply_to_id = str(comp.sender_id)
+
+        return msg
+
     # -------------------------------------------------------------------------
     # Event Handlers
     # -------------------------------------------------------------------------
@@ -610,7 +724,8 @@ class Main(star.Star):
 
         assert self._analyzer is not None
 
-        msg = self._analyzer.extract_message(event)
+        # 使用支持图像转述的方法提取消息
+        msg = await self._extract_message_with_caption(event)
         state = self._sessions.get(event.unified_msg_origin)
         self._analyzer.infer_addressee(
             msg,
@@ -624,10 +739,13 @@ class Main(star.Star):
 
         # 每记录 50 条消息输出一次统计
         if self._stats.messages_recorded % 50 == 0:
+            caption_info = ""
+            if self._image_caption_enabled:
+                caption_info = f", 图像转述 {self._image_caption_count} 次"
             logger.info(
                 f"[ContextAware] 统计: 已记录 {self._stats.messages_recorded} 条消息, "
                 f"已注入 {self._stats.scenes_injected} 次场景, "
-                f"活跃会话 {self._sessions.get_session_count()} 个"
+                f"活跃会话 {self._sessions.get_session_count()} 个{caption_info}"
             )
 
     @filter.on_llm_request(priority=-10)
@@ -645,7 +763,8 @@ class Main(star.Star):
 
         umo = event.unified_msg_origin
         if not self._sessions.has_session(umo):
-            msg = self._analyzer.extract_message(event)
+            # 使用支持图像转述的方法
+            msg = await self._extract_message_with_caption(event)
             self._sessions.add_message(umo, msg)
 
         try:
@@ -765,10 +884,15 @@ class Main(star.Star):
             f"{TRIGGER_NAMES.get(k, k)}: {v}"
             for k, v in sorted(self._stats.trigger_counts.items(), key=lambda x: -x[1])
         )
+        caption_info = ""
+        if self._image_caption_enabled:
+            caption_info = f", 图像转述 {self._image_caption_count} 次"
+            if self._image_caption_errors > 0:
+                caption_info += f" (失败 {self._image_caption_errors})"
         logger.info(
             f"[ContextAware] 插件已终止 | "
             f"统计: 消息 {self._stats.messages_recorded}, "
             f"场景注入 {self._stats.scenes_injected}, "
-            f"Bot回复 {self._stats.bot_responses_recorded} | "
+            f"Bot回复 {self._stats.bot_responses_recorded}{caption_info} | "
             f"触发类型: {trigger_summary or '无'}"
         )

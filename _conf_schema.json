@@ -34,5 +34,29 @@
     "description": "仅对群聊生效（私聊场景无需复杂分析）",
     "type": "bool",
     "default": true
+  },
+  "image_caption": {
+    "description": "启用图像转述（将群友发的图片转为文字描述）",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后每张图片会调用一次LLM，会产生额外费用和延迟"
+  },
+  "image_caption_provider_id": {
+    "description": "图像转述使用的提供商",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空则使用默认提供商，需支持图像识别能力",
+    "condition": {
+      "image_caption": true
+    }
+  },
+  "image_caption_prompt": {
+    "description": "图像转述提示词",
+    "type": "string",
+    "default": "请用中文简洁描述这张图片的内容，不超过50字。",
+    "condition": {
+      "image_caption": true
+    }
   }
 }
