@@ -76,3 +76,9 @@ Bot 就会明白：哦，这不是问我的，我该旁观或者以补充的身�
 ---
 
 **让 Bot 学会"察言观色"，不再尬聊。**
+
+
+本插件开发QQ群：215532038
+
+<img width="1284" height="2289" alt="qrcode_1767584668806" src="https://github.com/user-attachments/assets/113ccf60-044a-47f3-ac8f-432ae05f89ee" />
+
