@@ -877,6 +877,86 @@ class Main(star.Star):
             f"[ContextAware] Bot 回复已记录 (回复给: {sender_name}, 共 {self._stats.bot_responses_recorded} 次)"
         )
 
+    # -------------------------------------------------------------------------
+    # Public API - 供其他插件调用
+    # -------------------------------------------------------------------------
+
+    def get_recent_messages(
+        self,
+        unified_msg_origin: str,
+        count: int = 10,
+    ) -> list[dict]:
+        """获取指定会话的最近消息历史
+
+        供其他插件（如 poke_to_llm）调用，获取群聊上下文。
+
+        Args:
+            unified_msg_origin: 会话标识 (event.unified_msg_origin)
+            count: 获取的消息数量，默认 10
+
+        Returns:
+            消息列表，每条消息包含:
+            - sender_name: 发送者名称
+            - content: 消息内容
+            - timestamp: 时间戳
+            - is_bot: 是否为 Bot 消息
+            - talking_to: 对话对象
+        """
+        if not self._sessions.has_session(unified_msg_origin):
+            return []
+
+        state = self._sessions.get(unified_msg_origin)
+        messages = state.messages[-count:] if count > 0 else state.messages
+
+        return [
+            {
+                "sender_name": msg.sender_name,
+                "content": msg.content,
+                "timestamp": msg.timestamp,
+                "is_bot": msg.is_bot,
+                "talking_to": msg.talking_to_name or msg.talking_to,
+            }
+            for msg in messages
+        ]
+
+    def get_formatted_context(
+        self,
+        unified_msg_origin: str,
+        count: int = 10,
+    ) -> str:
+        """获取格式化的群聊上下文字符串
+
+        供其他插件调用，直接获取可注入 LLM 的上下文文本。
+
+        Args:
+            unified_msg_origin: 会话标识
+            count: 获取的消息数量
+
+        Returns:
+            格式化的对话上下文字符串
+        """
+        messages = self.get_recent_messages(unified_msg_origin, count)
+        if not messages:
+            return ""
+
+        lines = ["[最近的群聊消息]"]
+        for msg in messages:
+            name = "[你]" if msg["is_bot"] else msg["sender_name"]
+            lines.append(f"{name}: {msg['content']}")
+
+        return "\n".join(lines)
+
+    def has_session(self, unified_msg_origin: str) -> bool:
+        """检查是否有该会话的消息记录
+
+        Args:
+            unified_msg_origin: 会话标识
+
+        Returns:
+            是否存在该会话
+        """
+        return self._sessions.has_session(unified_msg_origin)
+
     async def terminate(self) -> None:
         """清理资源"""
         # 输出最终统计
