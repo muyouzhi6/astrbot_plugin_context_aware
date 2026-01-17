@@ -33,6 +33,6 @@ help: |
   - 轻量快速，图像转述为可选功能
 
   配置说明请查看插件配置页面。
-version: 2.5.0
+version: 2.5.1
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
