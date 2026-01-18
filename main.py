@@ -33,7 +33,7 @@ v2.3.0 更新:
 - 收紧上下文推断条件：减少误判风险
 
 Author: 木有知
-Version: 2.5.0
+Version: 2.5.1
 """
 
 from __future__ import annotations
@@ -197,6 +197,54 @@ class SessionManager:
         if session_id in self._sessions:
             return len(self._sessions[session_id].messages)
         return 0
+
+    def remove_message_by_id(self, session_id: str, msg_id: str) -> bool:
+        """根据消息ID删除指定消息
+        
+        供 recall_cancel 等插件调用，在消息撤回时清理记录。
+        
+        Args:
+            session_id: 会话标识 (unified_msg_origin)
+            msg_id: 要删除的消息ID
+            
+        Returns:
+            是否成功删除
+        """
+        if session_id not in self._sessions:
+            return False
+        
+        state = self._sessions[session_id]
+        original_count = len(state.messages)
+        state.messages = [m for m in state.messages if m.msg_id != msg_id]
+        
+        removed = original_count - len(state.messages)
+        return removed > 0
+
+    def remove_last_bot_message(self, session_id: str) -> bool:
+        """删除会话中最后一条 Bot 消息
+        
+        供 recall_cancel 等插件调用，在撤回时同时清理 Bot 的回复记录。
+        
+        Args:
+            session_id: 会话标识 (unified_msg_origin)
+            
+        Returns:
+            是否成功删除
+        """
+        if session_id not in self._sessions:
+            return False
+        
+        state = self._sessions[session_id]
+        if not state.messages:
+            return False
+        
+        # 从后往前找最后一条 Bot 消息
+        for i in range(len(state.messages) - 1, -1, -1):
+            if state.messages[i].is_bot:
+                del state.messages[i]
+                return True
+        
+        return False
 
 
 # ============================================================================
@@ -591,7 +639,7 @@ class Main(star.Star):
         self._image_caption_count = 0
         self._image_caption_errors = 0
 
-        version = "2.5.0"
+        version = "2.5.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -995,6 +1043,39 @@ class Main(star.Star):
             是否存在该会话
         """
         return self._sessions.has_session(unified_msg_origin)
+
+    def remove_message(self, unified_msg_origin: str, msg_id: str) -> bool:
+        """删除指定会话中的指定消息
+        
+        供 recall_cancel 等插件调用，在消息撤回时清理记录。
+        
+        Args:
+            unified_msg_origin: 会话标识
+            msg_id: 要删除的消息ID
+            
+        Returns:
+            是否成功删除
+        """
+        result = self._sessions.remove_message_by_id(unified_msg_origin, msg_id)
+        if result:
+            logger.debug(f"[ContextAware] 已删除消息记录 msg_id={msg_id}")
+        return result
+
+    def remove_last_bot_response(self, unified_msg_origin: str) -> bool:
+        """删除指定会话中最后一条 Bot 回复
+        
+        供 recall_cancel 等插件调用，在撤回时同时清理 Bot 的回复记录。
+        
+        Args:
+            unified_msg_origin: 会话标识
+            
+        Returns:
+            是否成功删除
+        """
+        result = self._sessions.remove_last_bot_message(unified_msg_origin)
+        if result:
+            logger.debug("[ContextAware] 已删除最后一条 Bot 回复记录")
+        return result
 
     async def terminate(self) -> None:
         """清理资源"""
