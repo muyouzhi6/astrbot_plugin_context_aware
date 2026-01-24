@@ -75,7 +75,9 @@
     "description": "图像转述超时时间（秒）",
     "type": "int",
     "default": 60,
-    "hint": "本地模型或慢速API建议设置更长时间（如120秒）",
+    "min": 10,
+    "max": 600,
+    "hint": "本地模型或慢速API建议设置更长时间（如120-300秒）",
     "condition": {
       "image_caption": true
     }
