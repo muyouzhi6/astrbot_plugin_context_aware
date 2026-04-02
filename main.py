@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.1.1 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.2 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.1.1 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.2 更新:
+- [FIX] 唤醒词判定改为显式匹配 wake_prefix，避免把异常触发误判成 wake_word
+- [FIX] 多个 @ 对象时保留完整对话目标，避免只显示第一个人
 
 v3.1.1 更新:
 - [FIX] 修复 SessionState 字段重复定义问题
@@ -39,7 +43,7 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.1.1
+Version: 3.1.2
 """
 
 from __future__ import annotations
@@ -159,6 +163,89 @@ class MessageRecord:
     talking_to: str = "group"
     talking_to_name: str = "群聊"
     at_targets: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _normalize_at_target(
+    bot_id: str,
+    target_id: str,
+    target_name: str | None,
+) -> tuple[str, str]:
+    """统一 @ 目标的表示，Bot 使用稳定标识避免后续判断分裂。"""
+    normalized_id = str(target_id or "").strip()
+    if normalized_id == bot_id:
+        return "bot", "你"
+
+    normalized_name = str(target_name or normalized_id).strip() or normalized_id
+    return normalized_id, normalized_name
+
+
+def _unique_targets(targets: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """按 target_id 去重，保留首次出现顺序。"""
+    seen: set[str] = set()
+    normalized: list[tuple[str, str]] = []
+    for target_id, target_name in targets:
+        normalized_id = str(target_id or "").strip()
+        if not normalized_id or normalized_id in seen:
+            continue
+        seen.add(normalized_id)
+        normalized_name = str(target_name or normalized_id).strip() or normalized_id
+        normalized.append((normalized_id, normalized_name))
+    return normalized
+
+
+def _format_name_list(names: list[str]) -> str:
+    """把多个名字拼成更自然的中文列举。"""
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]}和{names[1]}"
+    return f"{'、'.join(names[:-1])}和{names[-1]}"
+
+
+def _explicit_addressees(
+    msg: MessageRecord,
+    *,
+    bot_label: str = "你",
+) -> list[tuple[str, str]]:
+    """提取消息里显式出现的 @ 目标。"""
+    targets = _unique_targets(msg.at_targets)
+    if not targets:
+        return []
+    return [
+        (target_id, bot_label if target_id == "bot" else target_name)
+        for target_id, target_name in targets
+    ]
+
+
+def _other_explicit_target_names(msg: MessageRecord) -> list[str]:
+    """获取除 Bot 外其他被显式点名的对象名称。"""
+    return [
+        target_name
+        for target_id, target_name in _explicit_addressees(msg)
+        if target_id != "bot"
+    ]
+
+
+def _describe_addressee(
+    msg: MessageRecord,
+    *,
+    bot_label: str = "你（Bot）",
+    group_label: str = "群聊",
+    multi_target_bot_label: str = "你",
+) -> str:
+    """根据显式目标和推断结果生成更贴近真实群聊的对话对象描述。"""
+    explicit_targets = _explicit_addressees(msg, bot_label=multi_target_bot_label)
+    if len(explicit_targets) > 1:
+        return _format_name_list([target_name for _, target_name in explicit_targets])
+    if msg.talking_to == "bot":
+        return bot_label
+    if msg.talking_to == "group":
+        return group_label
+    if explicit_targets:
+        return explicit_targets[0][1]
+    return msg.talking_to_name or msg.talking_to
 
 
 @dataclass(slots=True)
@@ -498,13 +585,20 @@ class SceneAnalyzer:
     v3.0.0: 添加 bot_id 只读属性，支持自定义回复特征词
     """
 
-    __slots__ = ("_bot_id", "_bot_names", "_bot_name_patterns", "_reply_starters")
+    __slots__ = (
+        "_bot_id",
+        "_bot_names",
+        "_bot_name_patterns",
+        "_reply_starters",
+        "_wake_prefixes",
+    )
 
     def __init__(
         self, 
         bot_id: str, 
         bot_names: list[str] | None = None,
         reply_starters: frozenset[str] | None = None,
+        wake_prefixes: list[str] | None = None,
     ) -> None:
         self._bot_id = bot_id
         names = [n.lower() for n in (bot_names or []) if n]
@@ -520,6 +614,11 @@ class SceneAnalyzer:
                 compiled.append((n, None))
         self._bot_name_patterns: tuple[tuple[str, re.Pattern[str] | None], ...] = tuple(compiled)
         self._reply_starters = reply_starters or DEFAULT_REPLY_STARTERS
+        self._wake_prefixes: tuple[str, ...] = tuple(
+            str(prefix).strip()
+            for prefix in (wake_prefixes or [])
+            if str(prefix).strip()
+        )
 
     @property
     def bot_id(self) -> str:
@@ -554,7 +653,9 @@ class SceneAnalyzer:
         for comp in event.get_messages():
             if isinstance(comp, At):
                 qq_str = str(comp.qq)
-                msg.at_targets.append((qq_str, comp.name or qq_str))
+                msg.at_targets.append(
+                    _normalize_at_target(self._bot_id, qq_str, comp.name or qq_str)
+                )
                 if qq_str == self._bot_id:
                     msg.at_bot = True
             elif isinstance(comp, AtAll):
@@ -564,6 +665,31 @@ class SceneAnalyzer:
                     msg.reply_to_id = str(comp.sender_id)
 
         return msg
+
+    def _is_explicit_wake_trigger(self, event: AstrMessageEvent) -> bool:
+        """仅在能明确观察到 wake_prefix 时才判定为 wake_word。"""
+        if not self._wake_prefixes:
+            return False
+
+        original_text = str(
+            getattr(event.message_obj, "message_str", "") or event.message_str or ""
+        ).strip()
+        if not original_text:
+            return False
+
+        messages = event.get_messages()
+        for wake_prefix in self._wake_prefixes:
+            if not original_text.startswith(wake_prefix):
+                continue
+            if (
+                not event.is_private_chat()
+                and messages
+                and isinstance(messages[0], At)
+                and str(messages[0].qq) not in {self._bot_id, "all"}
+            ):
+                return False
+            return True
+        return False
 
     def detect_trigger(
         self, event: AstrMessageEvent, msg: MessageRecord
@@ -588,7 +714,13 @@ class SceneAnalyzer:
         if msg.reply_to_id == self._bot_id:
             return TRIGGER_REPLY, f"{sender} 回复了你之前的消息"
 
-        if event.is_at_or_wake_command and not msg.at_bot:
+        if self._is_explicit_wake_trigger(event):
+            other_targets = _other_explicit_target_names(msg)
+            if other_targets:
+                return (
+                    TRIGGER_WAKE,
+                    f"{sender} 使用唤醒词呼叫你，并同时在和 {_format_name_list(other_targets)} 对话",
+                )
             return TRIGGER_WAKE, f"{sender} 使用唤醒词呼叫你"
 
         if self._bot_names:
@@ -603,6 +735,15 @@ class SceneAnalyzer:
 
         if event.get_extra(ExtraKeys.ACTIVE_TRIGGER) or event.get_extra(ExtraKeys.ACTIVE_REPLY_TRIGGERED):
             return TRIGGER_ACTIVE, "你是主动加入这个对话的，没有人在叫你"
+
+        if event.is_at_or_wake_command:
+            other_targets = _other_explicit_target_names(msg)
+            if other_targets and not msg.at_bot and not msg.at_all and msg.reply_to_id != self._bot_id:
+                return (
+                    TRIGGER_ACTIVE,
+                    f"{sender} 明确在和 {_format_name_list(other_targets)} 对话，你是被动卷入的",
+                )
+            return TRIGGER_UNKNOWN, "存在触发信号，但不是在明确呼叫你"
 
         # 如果没有任何显式唤醒条件但仍触发了 LLM 请求，通常属于“主动回复/主动搭话”类场景
         # （例如 AstrBot 的主动回复功能或其他插件主动调用 request_llm）
@@ -629,17 +770,29 @@ class SceneAnalyzer:
         Returns:
             推断原因常量 (InferenceReason.*)
         """
+        explicit_targets = _explicit_addressees(msg)
+
         # ===== 规则1: 明确的 @ Bot（高置信度）=====
         if msg.at_bot:
-            msg.talking_to, msg.talking_to_name = "bot", "你"
+            msg.talking_to = "bot"
+            msg.talking_to_name = _format_name_list(
+                [target_name for _, target_name in explicit_targets]
+            ) or "你"
             return InferenceReason.RULE_1_AT_BOT
 
         # ===== 规则2: @ 其他人（高置信度）=====
-        if msg.at_targets:
-            target_id, target_name = msg.at_targets[0]
-            if target_id != self._bot_id:
-                msg.talking_to, msg.talking_to_name = target_id, target_name
-                return InferenceReason.RULE_2_AT_OTHER
+        non_bot_targets = [
+            (target_id, target_name)
+            for target_id, target_name in explicit_targets
+            if target_id != "bot"
+        ]
+        if non_bot_targets:
+            target_id, _ = non_bot_targets[0]
+            msg.talking_to = target_id
+            msg.talking_to_name = _format_name_list(
+                [target_name for _, target_name in non_bot_targets]
+            )
+            return InferenceReason.RULE_2_AT_OTHER
 
         # ===== 规则3: 引用回复消息（高置信度）=====
         if msg.reply_to_id:
@@ -773,12 +926,12 @@ class SceneGenerator:
         is_talking_to_bot = current.talking_to == "bot"
         is_talking_to_group = current.talking_to == "group"
 
-        if is_talking_to_bot:
-            addressee_desc = "你（Bot）"
-        elif is_talking_to_group:
-            addressee_desc = "群里所有人（非特定对象）"
-        else:
-            addressee_desc = current.talking_to_name
+        addressee_desc = _describe_addressee(
+            current,
+            bot_label="你（Bot）",
+            group_label="群里所有人（非特定对象）",
+            multi_target_bot_label="你",
+        )
 
         parts.append(
             f'  <current_message>'
@@ -802,8 +955,11 @@ class SceneGenerator:
         if show_flow and len(flow) > 1:
             flow_lines: list[str] = []
             for m in flow[-5:]:
-                to_name = "你" if m.talking_to == "bot" else (
-                    "群" if m.talking_to == "group" else m.talking_to_name
+                to_name = _describe_addressee(
+                    m,
+                    bot_label="你",
+                    group_label="群",
+                    multi_target_bot_label="你",
                 )
                 sender = "[你]" if m.is_bot else m.sender_name
                 preview = m.content[:20] + ("..." if len(m.content) > 20 else "")
@@ -840,6 +996,16 @@ class SceneGenerator:
         - 主动触发 → 必须明确告知 Bot 它是主动插入的
         - 未知触发 → 最保守处理
         """
+        shared_targets = _other_explicit_target_names(msg)
+
+        # ===== 被明确呼叫，且同时点名了其他对象 =====
+        if trigger in (TRIGGER_AT, TRIGGER_WAKE, TRIGGER_REPLY) and shared_targets:
+            others_text = _format_name_list(shared_targets)
+            return (
+                f"用户正在同时对你和{others_text}说话，你是被共同点名的对象之一。"
+                "请正常回应，但不要把这理解成只针对你一个人的单独提问。"
+            )
+
         # ===== 被明确呼叫 - 正常回复 =====
         if trigger in (TRIGGER_AT, TRIGGER_AT_ALL, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
             return "用户在和你对话，请正常回应。"
@@ -971,7 +1137,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.1.1"
+        version = "3.1.2"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -1055,11 +1221,15 @@ class Main(star.Star):
         # v3.0.0: 支持自定义回复特征词
         custom_starters = self._cfg_list("reply_starters", None)
         reply_starters = frozenset(custom_starters) if custom_starters else None
+        astrbot_config = self._context.get_config()
+        wake_prefixes_raw = astrbot_config.get("wake_prefix", []) if astrbot_config else []
+        wake_prefixes = [str(prefix) for prefix in wake_prefixes_raw if prefix]
 
         self._analyzer = SceneAnalyzer(
             bot_id=self._bot_id, 
             bot_names=bot_names,
             reply_starters=reply_starters,
+            wake_prefixes=wake_prefixes,
         )
         logger.info(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
         return True
@@ -1087,12 +1257,12 @@ class Main(star.Star):
         lines: list[str] = []
         for m in msgs:
             sender = "[你]" if m.is_bot else m.sender_name
-            if m.talking_to == "bot":
-                to = "[你]"
-            elif m.talking_to == "group":
-                to = "群聊"
-            else:
-                to = m.talking_to_name or m.talking_to
+            to = _describe_addressee(
+                m,
+                bot_label="[你]",
+                group_label="群聊",
+                multi_target_bot_label="[你]",
+            )
             content = (m.content or "").replace("\n", " ").strip()
             if len(content) > 120:
                 content = content[:117] + "..."
@@ -1304,7 +1474,9 @@ class Main(star.Star):
         for comp in event.get_messages():
             if isinstance(comp, At):
                 qq_str = str(comp.qq)
-                msg.at_targets.append((qq_str, comp.name or qq_str))
+                msg.at_targets.append(
+                    _normalize_at_target(self._analyzer.bot_id, qq_str, comp.name or qq_str)
+                )
                 if qq_str == self._analyzer.bot_id:
                     msg.at_bot = True
             elif isinstance(comp, AtAll):
@@ -1354,9 +1526,11 @@ class Main(star.Star):
             pass
 
         if self._cfg_bool("debug_inference", False):
-            talking_to_display = (
-                "Bot" if msg.talking_to == "bot"
-                else ("群聊" if msg.talking_to == "group" else msg.talking_to_name)
+            talking_to_display = _describe_addressee(
+                msg,
+                bot_label="Bot",
+                group_label="群聊",
+                multi_target_bot_label="Bot",
             )
             logger.debug(
                 f"[ContextAware] 推断: {msg.sender_name} → {talking_to_display} "
@@ -1492,9 +1666,11 @@ class Main(star.Star):
 
             # 关键日志：每次场景注入都输出
             trigger_name = TRIGGER_NAMES.get(trigger_type, trigger_type)
-            talking_to_display = (
-                "Bot" if current.talking_to == "bot"
-                else ("群聊" if current.talking_to == "group" else current.talking_to_name)
+            talking_to_display = _describe_addressee(
+                current,
+                bot_label="Bot",
+                group_label="群聊",
+                multi_target_bot_label="Bot",
             )
             logger.info(
                 f"[ContextAware] ✓ 场景注入 #{self._stats.scenes_injected} | "
@@ -1604,7 +1780,12 @@ class Main(star.Star):
                 "content": msg.content,
                 "timestamp": msg.timestamp,
                 "is_bot": msg.is_bot,
-                "talking_to": msg.talking_to_name or msg.talking_to,
+                "talking_to": _describe_addressee(
+                    msg,
+                    bot_label="你",
+                    group_label="群聊",
+                    multi_target_bot_label="你",
+                ),
             }
             for msg in messages
         ]

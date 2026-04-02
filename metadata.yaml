@@ -50,6 +50,6 @@ help: |
   - v3.0.0: 并发安全、高性能、可观测
 
   配置说明请查看插件配置页面。
-version: 3.1.1
+version: 3.1.2
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
