@@ -47,6 +47,15 @@
     "default": true,
     "hint": "让未触发对话的图片也以 <recent_images> 形式显式进入后续 LLM 请求；启用图像转述后会显示图片描述"
   },
+  "show_recent_images_allow_gif": {
+    "description": "允许将GIF图片消息加入最近图片上下文",
+    "type": "bool",
+    "default": false,
+    "hint": "仅当后续模型支持image/gif或你确认需要GIF上下文时开启；关闭时GIF不会进入<recent_images>，也不会触发图像转述",
+    "condition": {
+      "show_recent_images": true
+    }
+  },
   "image_context_window": {
     "description": "图片上下文扫描窗口",
     "type": "int",

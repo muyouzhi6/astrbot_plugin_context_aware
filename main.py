@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.1.3 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.4 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.1.3 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.4 更新:
+- [FIX] 最近图片上下文支持过滤 GIF，避免不支持 image/gif 的模型在后续请求中报错
+- [CONFIG] 新增 show_recent_images_allow_gif 开关，默认不将 GIF 加入 <recent_images>
 
 v3.1.3 更新:
 - [FIX] 图片上下文记录只扩展到图片概要，避免纯表情/@/引用等占位消息污染对话流
@@ -47,7 +51,7 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.1.3
+Version: 3.1.4
 """
 
 from __future__ import annotations
@@ -170,6 +174,8 @@ class MessageRecord:
     message_outline: str = ""
     has_image: bool = False
     image_count: int = 0
+    has_gif: bool = False
+    gif_count: int = 0
 
 
 def _normalize_at_target(
@@ -238,6 +244,49 @@ def _looks_like_image_outline(text: str) -> bool:
     """识别平台概要中的图片占位，兼容不同适配器的文案。"""
     lowered = text.lower()
     return any(token in lowered for token in ("[图片", "图片", "照片", "[image", "image", "photo"))
+
+
+_GIF_BASE64_PREFIXES: Final[tuple[str, str]] = ("R0lGODlh", "R0lGODdh")
+
+
+def _image_ref_looks_like_gif(image_ref: str) -> bool:
+    """尽量在投递给视觉模型前识别 GIF，避免不支持 image/gif 的模型报错。"""
+    ref = (image_ref or "").strip()
+    if not ref:
+        return False
+
+    lowered = ref.lower()
+    if "image/gif" in lowered:
+        return True
+
+    ref_without_query = lowered.split("?", 1)[0].split("#", 1)[0]
+    if ref_without_query.endswith(".gif"):
+        return True
+
+    local_path = ref
+    if lowered.startswith("file:///"):
+        local_path = ref[8:]
+    elif lowered.startswith("file://"):
+        local_path = ref[7:]
+    if "://" not in local_path and not lowered.startswith(("data:", "base64:")):
+        try:
+            with open(local_path, "rb") as f:
+                return f.read(6) in (b"GIF87a", b"GIF89a")
+        except OSError:
+            pass
+
+    payload = ref
+    lowered_payload = payload.lower()
+    if lowered_payload.startswith("base64://"):
+        payload = payload[len("base64://"):]
+    elif lowered_payload.startswith("base64:"):
+        payload = payload[len("base64:"):]
+
+    if payload.lower().startswith("data:") and "," in payload:
+        payload = payload.split(",", 1)[1]
+
+    payload = payload.lstrip()
+    return payload.startswith(_GIF_BASE64_PREFIXES)
 
 
 def _explicit_addressees(
@@ -661,11 +710,16 @@ class SceneAnalyzer:
         """Bot ID 只读属性（v3.0.0: 修复封装破坏）"""
         return self._bot_id
 
+    @staticmethod
+    def _image_ref_from_component(comp: Image) -> str:
+        return comp.url if comp.url else (comp.file or "")
+
     def extract_message(self, event: AstrMessageEvent) -> MessageRecord:
         """从事件提取消息记录"""
         sender_id = event.get_sender_id()
         message_outline = _event_message_outline(event)
         image_count = 0
+        gif_count = 0
         has_plain_text = False
 
         # 提取消息内容，拼接所有文本和图片描述
@@ -679,11 +733,17 @@ class SceneAnalyzer:
                     parts.append(comp.text)
                 elif isinstance(comp, Image):
                     image_count += 1
+                    if _image_ref_looks_like_gif(self._image_ref_from_component(comp)):
+                        gif_count += 1
                     parts.append("[图片]")
             content = "".join(parts) if parts else (message_outline or "[消息]")
         else:
             has_plain_text = True
-            image_count = sum(1 for comp in event.get_messages() if isinstance(comp, Image))
+            for comp in event.get_messages():
+                if isinstance(comp, Image):
+                    image_count += 1
+                    if _image_ref_looks_like_gif(self._image_ref_from_component(comp)):
+                        gif_count += 1
         has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
 
         msg = MessageRecord(
@@ -696,6 +756,8 @@ class SceneAnalyzer:
             message_outline=message_outline,
             has_image=has_image,
             image_count=max(image_count, 1 if has_image else 0),
+            has_gif=gif_count > 0,
+            gif_count=gif_count,
         )
 
         for comp in event.get_messages():
@@ -963,6 +1025,7 @@ class SceneGenerator:
         *,
         show_flow: bool = True,
         show_recent_images: bool = True,
+        show_recent_gifs: bool = True,
         image_flow: list[MessageRecord] | None = None,
     ) -> str:
         """生成场景描述，重点强调对话对象"""
@@ -1025,6 +1088,9 @@ class SceneGenerator:
                 content = m.content or ""
                 if not m.has_image and "[图片" not in content:
                     continue
+                visible_image_count = max(m.image_count - m.gif_count, 0)
+                if m.has_gif and not show_recent_gifs and visible_image_count <= 0:
+                    continue
                 to_name = _describe_addressee(
                     m,
                     bot_label="你",
@@ -1034,7 +1100,8 @@ class SceneGenerator:
                 sender = "[你]" if m.is_bot else m.sender_name
                 preview_source = content or m.message_outline or "[图片]"
                 preview = preview_source[:120] + ("..." if len(preview_source) > 120 else "")
-                count_attr = f' count="{m.image_count}"' if m.image_count > 1 else ""
+                display_count = visible_image_count if m.has_gif and not show_recent_gifs else m.image_count
+                count_attr = f' count="{display_count}"' if display_count > 1 else ""
                 image_lines.append(
                     f'    <image sender="{esc(sender)}" talking_to="{esc(to_name)}"{count_attr}>'
                     f"{esc(preview)}</image>"
@@ -1176,6 +1243,7 @@ class Main(star.Star):
         self._group_only = self._cfg_bool("only_group_chat", True)
         self._warn_builtin_ltm = self._cfg_bool("warn_builtin_ltm", True)
         self._show_recent_images = self._cfg_bool("show_recent_images", True)
+        self._show_recent_images_allow_gif = self._cfg_bool("show_recent_images_allow_gif", False)
         self._image_context_window = max(1, self._cfg_int("image_context_window", 20))
         self._builtin_ltm_warned: set[str] = set()
 
@@ -1217,7 +1285,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.1.3"
+        version = "3.1.4"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -1557,6 +1625,7 @@ class Main(star.Star):
         parts: list[str] = []
         message_outline = _event_message_outline(event)
         image_count = 0
+        gif_count = 0
         has_plain_text = False
 
         # 提取消息内容
@@ -1566,9 +1635,14 @@ class Main(star.Star):
                 parts.append(comp.text)
             elif isinstance(comp, Image):
                 image_count += 1
+                image_url = SceneAnalyzer._image_ref_from_component(comp)
+                is_gif = _image_ref_looks_like_gif(image_url)
+                if is_gif:
+                    gif_count += 1
                 # 尝试图像转述
-                if self._image_caption_enabled:
-                    image_url = comp.url if comp.url else comp.file
+                if self._image_caption_enabled and (
+                    not is_gif or self._show_recent_images_allow_gif
+                ):
                     if image_url:
                         caption = await self._get_image_caption(image_url)
                         if caption:
@@ -1595,6 +1669,8 @@ class Main(star.Star):
             message_outline=message_outline,
             has_image=has_image,
             image_count=max(image_count, 1 if has_image else 0),
+            has_gif=gif_count > 0,
+            gif_count=gif_count,
         )
 
         # 提取 @ 和回复信息
@@ -1791,6 +1867,7 @@ class Main(star.Star):
                 summary=snapshot.summary,
                 show_flow=bool(self._cfg("enable_dialogue_flow", True)),
                 show_recent_images=self._show_recent_images,
+                show_recent_gifs=self._show_recent_images_allow_gif,
                 image_flow=image_flow,
             )
 
@@ -1924,6 +2001,8 @@ class Main(star.Star):
                 ),
                 "has_image": msg.has_image,
                 "image_count": msg.image_count,
+                "has_gif": msg.has_gif,
+                "gif_count": msg.gif_count,
                 "message_outline": msg.message_outline,
             }
             for msg in messages
