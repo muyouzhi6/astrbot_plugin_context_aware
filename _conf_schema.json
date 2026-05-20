@@ -35,6 +35,26 @@
     "type": "bool",
     "default": true
   },
+  "warn_builtin_ltm": {
+    "description": "检测到内置群聊上下文感知时输出警告",
+    "type": "bool",
+    "default": true,
+    "hint": "建议关闭 AstrBot 内置群聊上下文感知，避免和本插件重复注入群聊历史"
+  },
+  "show_recent_images": {
+    "description": "在场景提示中单独列出最近图片消息",
+    "type": "bool",
+    "default": true,
+    "hint": "让未触发对话的图片也以 <recent_images> 形式显式进入后续 LLM 请求；启用图像转述后会显示图片描述"
+  },
+  "image_context_window": {
+    "description": "图片上下文扫描窗口",
+    "type": "int",
+    "default": 20,
+    "min": 1,
+    "max": 200,
+    "hint": "从最近 N 条消息中提取图片消息并单独注入，避免图片上下文被普通对话窗口截掉"
+  },
   "debug_inference": {
     "description": "启用推断规则调试日志",
     "type": "bool",

@@ -4,6 +4,12 @@
 
 ---
 
+## 版本要求
+
+需要 AstrBot `>=4.24.0`。本插件会把场景提示标记为临时内容，避免动态上下文被写入会话历史。
+
+---
+
 # ⚠️ 安装后必须配置
 
 ## 🚨 必须关闭框架内置的「群聊上下文感知」
@@ -109,6 +115,9 @@ provider_settings:
 | `dialogue_window` | 注入 LLM 的对话流条数 | `8` |
 | `enable_dialogue_flow` | 显示对话流（谁→谁） | `true` |
 | `only_group_chat` | 仅群聊生效 | `true` |
+| `warn_builtin_ltm` | 检测到内置群聊上下文感知时输出警告 | `true` |
+| `show_recent_images` | 单独列出最近图片消息，避免图片上下文淹没在普通对话流里 | `true` |
+| `image_context_window` | 从最近 N 条消息里提取图片并单独注入 | `20` |
 
 ### 图像转述配置
 
@@ -119,6 +128,18 @@ provider_settings:
 | `image_caption_prompt` | 图像转述提示词 | `请用中文简洁描述...` |
 
 **注意**：启用图像转述后，每张图片会调用一次 LLM，会产生额外费用和延迟。
+
+### 图片上下文增强
+
+即使群友发送图片时没有触发 Bot，本插件也会记录图片消息。后续触发 LLM 时，会从最近 `image_context_window` 条消息里提取图片，单独进入 `<recent_images>` 区块：
+
+```xml
+<recent_images>
+  <image sender="小明" talking_to="群">[图片: 一张会议白板照片，写着项目排期]</image>
+</recent_images>
+```
+
+如果未启用图像转述，图片会使用 AstrBot 的消息概要或 `[图片]` 占位进入上下文；如果启用图像转述，则会附带视觉模型生成的图片描述。
 
 ---
 

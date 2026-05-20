@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.1.2 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.3 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.1.2 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.3 更新:
+- [FIX] 图片上下文记录只扩展到图片概要，避免纯表情/@/引用等占位消息污染对话流
+- [CHANGE] 最低 AstrBot 版本提高到 4.24.0，确保临时注入不会写入会话历史
 
 v3.1.2 更新:
 - [FIX] 唤醒词判定改为显式匹配 wake_prefix，避免把异常触发误判成 wake_word
@@ -43,7 +47,7 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.1.2
+Version: 3.1.3
 """
 
 from __future__ import annotations
@@ -163,6 +167,9 @@ class MessageRecord:
     talking_to: str = "group"
     talking_to_name: str = "群聊"
     at_targets: list[tuple[str, str]] = field(default_factory=list)
+    message_outline: str = ""
+    has_image: bool = False
+    image_count: int = 0
 
 
 def _normalize_at_target(
@@ -202,6 +209,35 @@ def _format_name_list(names: list[str]) -> str:
     if len(names) == 2:
         return f"{names[0]}和{names[1]}"
     return f"{'、'.join(names[:-1])}和{names[-1]}"
+
+
+def _clean_one_line(value: Any) -> str:
+    """压缩消息概要为单行文本，避免注入上下文时破坏结构。"""
+    text = "" if value is None else str(value)
+    return " ".join(text.replace("\r", " ").replace("\n", " ").split())
+
+
+def _event_message_outline(event: AstrMessageEvent) -> str:
+    """优先使用 AstrBot 消息概要，以保留图片/语音等非文本消息占位。"""
+    outline = ""
+    try:
+        outline = event.get_message_outline()
+    except Exception:
+        outline = ""
+    if not outline:
+        try:
+            outline = event.get_message_str()
+        except Exception:
+            outline = ""
+    if not outline:
+        outline = str(getattr(event.message_obj, "message_str", "") or event.message_str or "")
+    return _clean_one_line(outline)
+
+
+def _looks_like_image_outline(text: str) -> bool:
+    """识别平台概要中的图片占位，兼容不同适配器的文案。"""
+    lowered = text.lower()
+    return any(token in lowered for token in ("[图片", "图片", "照片", "[image", "image", "photo"))
 
 
 def _explicit_addressees(
@@ -628,6 +664,9 @@ class SceneAnalyzer:
     def extract_message(self, event: AstrMessageEvent) -> MessageRecord:
         """从事件提取消息记录"""
         sender_id = event.get_sender_id()
+        message_outline = _event_message_outline(event)
+        image_count = 0
+        has_plain_text = False
 
         # 提取消息内容，拼接所有文本和图片描述
         content = event.message_str or ""
@@ -636,10 +675,16 @@ class SceneAnalyzer:
             parts: list[str] = []
             for comp in event.get_messages():
                 if isinstance(comp, Plain) and comp.text:
+                    has_plain_text = True
                     parts.append(comp.text)
                 elif isinstance(comp, Image):
+                    image_count += 1
                     parts.append("[图片]")
-            content = "".join(parts) if parts else "[消息]"
+            content = "".join(parts) if parts else (message_outline or "[消息]")
+        else:
+            has_plain_text = True
+            image_count = sum(1 for comp in event.get_messages() if isinstance(comp, Image))
+        has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
 
         msg = MessageRecord(
             msg_id=str(event.message_obj.message_id),
@@ -648,6 +693,9 @@ class SceneAnalyzer:
             content=content[:500],
             timestamp=time.time(),
             is_bot=(sender_id == self._bot_id),
+            message_outline=message_outline,
+            has_image=has_image,
+            image_count=max(image_count, 1 if has_image else 0),
         )
 
         for comp in event.get_messages():
@@ -914,6 +962,8 @@ class SceneGenerator:
         summary: str = "",
         *,
         show_flow: bool = True,
+        show_recent_images: bool = True,
+        image_flow: list[MessageRecord] | None = None,
     ) -> str:
         """生成场景描述，重点强调对话对象"""
         esc = self._escape
@@ -967,6 +1017,32 @@ class SceneGenerator:
             parts.append('  <recent_flow>')
             parts.extend(flow_lines)
             parts.append('  </recent_flow>')
+
+        if show_recent_images:
+            image_lines: list[str] = []
+            image_source = image_flow if image_flow is not None else flow
+            for m in image_source:
+                content = m.content or ""
+                if not m.has_image and "[图片" not in content:
+                    continue
+                to_name = _describe_addressee(
+                    m,
+                    bot_label="你",
+                    group_label="群",
+                    multi_target_bot_label="你",
+                )
+                sender = "[你]" if m.is_bot else m.sender_name
+                preview_source = content or m.message_outline or "[图片]"
+                preview = preview_source[:120] + ("..." if len(preview_source) > 120 else "")
+                count_attr = f' count="{m.image_count}"' if m.image_count > 1 else ""
+                image_lines.append(
+                    f'    <image sender="{esc(sender)}" talking_to="{esc(to_name)}"{count_attr}>'
+                    f"{esc(preview)}</image>"
+                )
+            if image_lines:
+                parts.append("  <recent_images>")
+                parts.extend(image_lines)
+                parts.append("  </recent_images>")
 
         # ===== 5. Bot 状态 =====
         if bot_status.get("active"):
@@ -1098,6 +1174,10 @@ class Main(star.Star):
 
         self._enabled = self._cfg_bool("enable", True)
         self._group_only = self._cfg_bool("only_group_chat", True)
+        self._warn_builtin_ltm = self._cfg_bool("warn_builtin_ltm", True)
+        self._show_recent_images = self._cfg_bool("show_recent_images", True)
+        self._image_context_window = max(1, self._cfg_int("image_context_window", 20))
+        self._builtin_ltm_warned: set[str] = set()
 
         # 图像转述配置
         self._image_caption_enabled = self._cfg_bool("image_caption", False)
@@ -1137,7 +1217,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.1.2"
+        version = "3.1.3"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -1184,7 +1264,13 @@ class Main(star.Star):
         try:
             extra_parts = getattr(req, 'extra_user_content_parts', None)
             if extra_parts is not None and isinstance(extra_parts, list):
-                extra_parts.append(TextPart(text=scene))
+                part = TextPart(text=scene)
+                mark_as_temp = getattr(part, "mark_as_temp", None)
+                if callable(mark_as_temp):
+                    temp_part = mark_as_temp()
+                    if temp_part is not None:
+                        part = temp_part
+                extra_parts.append(part)
                 return
         except Exception:
             pass
@@ -1202,6 +1288,36 @@ class Main(star.Star):
         if self._group_only and event.is_private_chat():
             return False
         return True
+
+    def _builtin_ltm_enabled(self, event: AstrMessageEvent) -> bool:
+        """检测 AstrBot 内置群聊上下文感知是否启用，避免重复注入。"""
+        try:
+            cfg = self._context.get_config(umo=event.unified_msg_origin)
+        except TypeError:
+            cfg = self._context.get_config()
+        except Exception:
+            return False
+        if not cfg:
+            return False
+        try:
+            settings = cfg.get("provider_ltm_settings", {})
+            return bool(settings.get("group_icl_enable", False))
+        except Exception:
+            return False
+
+    def _warn_if_builtin_ltm_enabled(self, event: AstrMessageEvent) -> None:
+        if not self._warn_builtin_ltm:
+            return
+        umo = event.unified_msg_origin
+        if umo in self._builtin_ltm_warned:
+            return
+        if not self._builtin_ltm_enabled(event):
+            return
+        self._builtin_ltm_warned.add(umo)
+        logger.warning(
+            "[ContextAware] 检测到 AstrBot 内置群聊上下文感知已启用，"
+            "建议关闭 provider_ltm_settings.group_icl_enable，避免重复注入群聊历史。"
+        )
 
     def _ensure_initialized(self, event: AstrMessageEvent) -> bool:
         """确保组件已初始化"""
@@ -1439,12 +1555,17 @@ class Main(star.Star):
 
         sender_id = event.get_sender_id()
         parts: list[str] = []
+        message_outline = _event_message_outline(event)
+        image_count = 0
+        has_plain_text = False
 
         # 提取消息内容
         for comp in event.get_messages():
             if isinstance(comp, Plain) and comp.text:
+                has_plain_text = True
                 parts.append(comp.text)
             elif isinstance(comp, Image):
+                image_count += 1
                 # 尝试图像转述
                 if self._image_caption_enabled:
                     image_url = comp.url if comp.url else comp.file
@@ -1459,7 +1580,10 @@ class Main(star.Star):
                 else:
                     parts.append("[图片]")
 
-        content = "".join(parts) if parts else (event.message_str or "[消息]")
+        has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
+        content = "".join(parts) if parts else (message_outline or "[消息]")
+        if has_image and image_count == 0 and "[图片" not in content:
+            content = f"[图片] {content}".strip()
 
         msg = MessageRecord(
             msg_id=str(event.message_obj.message_id),
@@ -1468,6 +1592,9 @@ class Main(star.Star):
             content=content[:500],
             timestamp=time.time(),
             is_bot=(sender_id == self._analyzer.bot_id),
+            message_outline=message_outline,
+            has_image=has_image,
+            image_count=max(image_count, 1 if has_image else 0),
         )
 
         # 提取 @ 和回复信息
@@ -1497,9 +1624,10 @@ class Main(star.Star):
         if not self._should_process(event):
             return
 
-        has_content = any(
-            isinstance(c, (Plain, Image)) for c in event.get_messages()
-        )
+        message_outline = _event_message_outline(event)
+        messages = event.get_messages()
+        has_content = any(isinstance(c, (Plain, Image)) for c in messages)
+        has_content = has_content or _looks_like_image_outline(message_outline)
         if not has_content:
             return
 
@@ -1564,6 +1692,7 @@ class Main(star.Star):
             return
 
         assert self._analyzer is not None
+        self._warn_if_builtin_ltm_enabled(event)
 
         umo = event.unified_msg_origin
         if not self._sessions.has_session(umo):
@@ -1634,6 +1763,11 @@ class Main(star.Star):
 
             window = self._cfg_int("dialogue_window", 8)
             flow = flow_source[-window:] if window > 0 else flow_source
+            image_flow = (
+                flow_source[-self._image_context_window:]
+                if self._image_context_window > 0
+                else flow_source
+            )
 
             now = time.time()
             bot_status: dict[str, float | str | bool] = {}
@@ -1656,6 +1790,8 @@ class Main(star.Star):
                 participants=participants,
                 summary=snapshot.summary,
                 show_flow=bool(self._cfg("enable_dialogue_flow", True)),
+                show_recent_images=self._show_recent_images,
+                image_flow=image_flow,
             )
 
             # 注入场景描述到请求（v3.0.0: 防止重复注入）
@@ -1786,6 +1922,9 @@ class Main(star.Star):
                     group_label="群聊",
                     multi_target_bot_label="你",
                 ),
+                "has_image": msg.has_image,
+                "image_count": msg.image_count,
+                "message_outline": msg.message_outline,
             }
             for msg in messages
         ]

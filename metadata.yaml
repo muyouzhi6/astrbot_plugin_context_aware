@@ -12,6 +12,10 @@ help: |
   - Bot状态：上次发言时间
   - 图像转述：可选功能，将群友发送的图片转为文字描述
 
+  v3.1.3 更新：
+  - [FIX] 图片上下文记录只扩展到图片概要，避免纯表情/@/引用等占位消息污染对话流
+  - [CHANGE] 最低 AstrBot 版本提高到 4.24.0，确保临时注入不会写入会话历史
+
   v3.0.0 重大更新（精品重构）：
   - [CRITICAL] 修复并发竞态：SessionManager 添加异步锁 + deque 自动裁剪
   - [HIGH] 图像转述优化：并发限流(Semaphore) + 超时控制 + URL缓存
@@ -50,6 +54,18 @@ help: |
   - v3.0.0: 并发安全、高性能、可观测
 
   配置说明请查看插件配置页面。
-version: 3.1.2
+version: 3.1.3
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
+astrbot_version: ">=4.24.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - discord
+  - slack
+  - kook
+  - lark
+  - satori
+  - misskey
+  - line
