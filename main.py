@@ -90,6 +90,11 @@ class ExtraKeys:
     ACTIVE_TRIGGER: Final[str] = "_active_trigger"
     ACTIVE_REPLY_TRIGGERED: Final[str] = "active_reply_triggered"
     CURRENT_MESSAGE_RECORD: Final[str] = "_context_aware_current_message_record"
+    GEMINI_STT_TRANSCRIPT: Final[str] = "_gemini_stt_transcript"
+    GEMINI_STT_RAW_TEXT: Final[str] = "_gemini_stt_raw_text"
+    GEMINI_STT_CACHE_ONLY: Final[str] = "_gemini_stt_cache_only"
+    GEMINI_STT_SHOULD_REPLY: Final[str] = "_gemini_stt_should_reply"
+    GEMINI_STT_REPLY_REASON: Final[str] = "_gemini_stt_reply_reason"
     
     # 场景注入标记，防止重复注入
     SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
@@ -225,6 +230,10 @@ def _clean_one_line(value: Any) -> str:
 
 def _event_message_outline(event: AstrMessageEvent) -> str:
     """优先使用 AstrBot 消息概要，以保留图片/语音等非文本消息占位。"""
+    transcript = _event_voice_transcript(event)
+    if transcript:
+        return transcript
+
     outline = ""
     try:
         outline = event.get_message_outline()
@@ -238,6 +247,23 @@ def _event_message_outline(event: AstrMessageEvent) -> str:
     if not outline:
         outline = str(getattr(event.message_obj, "message_str", "") or event.message_str or "")
     return _clean_one_line(outline)
+
+
+def _event_voice_transcript(event: AstrMessageEvent) -> str:
+    """读取 Gemini_STT 导出的语音转写，作为群聊上下文普通消息记录。"""
+    getter = getattr(event, "get_extra", None)
+    if not callable(getter):
+        return ""
+    try:
+        transcript = getter(ExtraKeys.GEMINI_STT_TRANSCRIPT, "") or getter(
+            ExtraKeys.GEMINI_STT_RAW_TEXT, ""
+        )
+    except Exception:
+        return ""
+    transcript = _clean_one_line(transcript)
+    if not transcript:
+        return ""
+    return f"[语音转写] {transcript}"
 
 
 def _looks_like_image_outline(text: str) -> bool:
@@ -414,6 +440,12 @@ class SessionManager:
         self._max_messages = max(10, max_messages)
         self._max_sessions = max(10, max_sessions)
 
+    def _has_message_id(self, state: SessionState, msg_id: str) -> bool:
+        normalized = str(msg_id or "").strip()
+        if not normalized:
+            return False
+        return any(existing.msg_id == normalized for existing in state.messages)
+
     def _get_lock(self, session_id: str) -> asyncio.Lock:
         """获取会话锁（惰性创建，使用 setdefault 保证原子性）"""
         # setdefault 是原子操作，避免竞态条件
@@ -459,13 +491,16 @@ class SessionManager:
         self._sessions[session_id] = state
         return state
 
-    async def add_message_async(self, session_id: str, msg: MessageRecord) -> None:
+    async def add_message_async(self, session_id: str, msg: MessageRecord) -> bool:
         """异步添加消息到会话（推荐使用，完全并发安全）"""
         async with self._get_lock(session_id):
             state = await self._get_or_create_session(session_id)
+            if self._has_message_id(state, msg.msg_id):
+                return False
             state.messages.append(msg)
             if not msg.is_bot:
                 state.last_user_interaction[msg.sender_id] = msg.timestamp
+            return True
 
     async def get_snapshot_async(self, session_id: str) -> SessionSnapshot:
         """获取会话快照（带会话锁）"""
@@ -526,15 +561,18 @@ class SessionManager:
                 return 0
             return len(state.messages)
 
-    def add_message(self, session_id: str, msg: MessageRecord) -> None:
+    def add_message(self, session_id: str, msg: MessageRecord) -> bool:
         """同步添加消息（向后兼容，但不推荐在并发场景使用）
         
         注意：此方法不提供完整的并发保护，仅用于向后兼容。
         """
         state = self.get(session_id)
+        if self._has_message_id(state, msg.msg_id):
+            return False
         state.messages.append(msg)
         if not msg.is_bot:
             state.last_user_interaction[msg.sender_id] = msg.timestamp
+        return True
 
     async def record_bot_response_async(
         self,
@@ -718,12 +756,13 @@ class SceneAnalyzer:
         """从事件提取消息记录"""
         sender_id = event.get_sender_id()
         message_outline = _event_message_outline(event)
+        voice_transcript = _event_voice_transcript(event)
         image_count = 0
         gif_count = 0
         has_plain_text = False
 
         # 提取消息内容，拼接所有文本和图片描述
-        content = event.message_str or ""
+        content = voice_transcript or event.message_str or ""
         if not content:
             # message_str 为空时，从消息组件中拼接
             parts: list[str] = []
@@ -1624,13 +1663,18 @@ class Main(star.Star):
         sender_id = event.get_sender_id()
         parts: list[str] = []
         message_outline = _event_message_outline(event)
+        voice_transcript = _event_voice_transcript(event)
         image_count = 0
         gif_count = 0
         has_plain_text = False
 
+        if voice_transcript:
+            parts.append(voice_transcript)
+            has_plain_text = True
+
         # 提取消息内容
         for comp in event.get_messages():
-            if isinstance(comp, Plain) and comp.text:
+            if isinstance(comp, Plain) and comp.text and not voice_transcript:
                 has_plain_text = True
                 parts.append(comp.text)
             elif isinstance(comp, Image):
@@ -1704,6 +1748,7 @@ class Main(star.Star):
         messages = event.get_messages()
         has_content = any(isinstance(c, (Plain, Image)) for c in messages)
         has_content = has_content or _looks_like_image_outline(message_outline)
+        has_content = has_content or bool(_event_voice_transcript(event))
         if not has_content:
             return
 
@@ -1742,8 +1787,9 @@ class Main(star.Star):
             )
 
         # v3.0.0: 使用异步方法确保并发安全
-        await self._sessions.add_message_async(event.unified_msg_origin, msg)
-        self._stats.messages_recorded += 1
+        added = await self._sessions.add_message_async(event.unified_msg_origin, msg)
+        if added:
+            self._stats.messages_recorded += 1
 
         # 每记录 50 条消息输出一次统计
         if self._stats.messages_recorded % 50 == 0:
@@ -1774,7 +1820,9 @@ class Main(star.Star):
         if not self._sessions.has_session(umo):
             # 使用支持图像转述的方法
             msg = await self._extract_message_with_caption(event)
-            await self._sessions.add_message_async(umo, msg)
+            added = await self._sessions.add_message_async(umo, msg)
+            if added:
+                self._stats.messages_recorded += 1
 
         try:
             snapshot = await self._sessions.get_snapshot_async(umo)
