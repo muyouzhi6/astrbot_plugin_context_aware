@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.1.4 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.5 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.1.4 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.5 更新:
+- [FIX] 兼容 Gemini_STT 语音转写上下文，记录为普通群聊消息
+- [FIX] 按消息 ID 幂等写入，避免 LLM 请求兜底记录和消息 handler 重复记录同一条语音
 
 v3.1.4 更新:
 - [FIX] 最近图片上下文支持过滤 GIF，避免不支持 image/gif 的模型在后续请求中报错
@@ -51,7 +55,7 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.1.4
+Version: 3.1.5
 """
 
 from __future__ import annotations
@@ -1324,7 +1328,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.1.4"
+        version = "3.1.5"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
