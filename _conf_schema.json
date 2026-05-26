@@ -64,6 +64,14 @@
     "max": 200,
     "hint": "从最近 N 条消息中提取图片消息并单独注入，避免图片上下文被普通对话窗口截掉"
   },
+  "voice_context_window": {
+    "description": "语音转写上下文扫描窗口",
+    "type": "int",
+    "default": 50,
+    "min": 0,
+    "max": 500,
+    "hint": "从最近 N 条消息中单独提取 Gemini_STT 的语音转写并注入；0 表示关闭"
+  },
   "debug_inference": {
     "description": "启用推断规则调试日志",
     "type": "bool",

@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.1.5 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.1.6 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,9 @@ AstrBot 上下文场景感知增强插件 v3.1.5 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.1.6 更新:
+- [FIX] 语音转写独立上下文窗口，避免高频群聊把未回复语音挤出最近对话流
 
 v3.1.5 更新:
 - [FIX] 兼容 Gemini_STT 语音转写上下文，记录为普通群聊消息
@@ -55,7 +58,7 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.1.5
+Version: 3.1.6
 """
 
 from __future__ import annotations
@@ -268,6 +271,10 @@ def _event_voice_transcript(event: AstrMessageEvent) -> str:
     if not transcript:
         return ""
     return f"[语音转写] {transcript}"
+
+
+def _looks_like_voice_transcript(text: str) -> bool:
+    return _clean_one_line(text).startswith("[语音转写]")
 
 
 def _looks_like_image_outline(text: str) -> bool:
@@ -1070,6 +1077,7 @@ class SceneGenerator:
         show_recent_images: bool = True,
         show_recent_gifs: bool = True,
         image_flow: list[MessageRecord] | None = None,
+        voice_flow: list[MessageRecord] | None = None,
     ) -> str:
         """生成场景描述，重点强调对话对象"""
         esc = self._escape
@@ -1153,6 +1161,29 @@ class SceneGenerator:
                 parts.append("  <recent_images>")
                 parts.extend(image_lines)
                 parts.append("  </recent_images>")
+
+        voice_source = voice_flow if voice_flow is not None else flow
+        voice_lines: list[str] = []
+        for m in voice_source:
+            content = m.content or ""
+            if not _looks_like_voice_transcript(content):
+                continue
+            to_name = _describe_addressee(
+                m,
+                bot_label="你",
+                group_label="群",
+                multi_target_bot_label="你",
+            )
+            sender = "[你]" if m.is_bot else m.sender_name
+            preview = content[:200] + ("..." if len(content) > 200 else "")
+            voice_lines.append(
+                f'    <voice sender="{esc(sender)}" talking_to="{esc(to_name)}">'
+                f"{esc(preview)}</voice>"
+            )
+        if voice_lines:
+            parts.append("  <recent_voice_transcripts>")
+            parts.extend(voice_lines[-5:])
+            parts.append("  </recent_voice_transcripts>")
 
         # ===== 5. Bot 状态 =====
         if bot_status.get("active"):
@@ -1288,6 +1319,7 @@ class Main(star.Star):
         self._show_recent_images = self._cfg_bool("show_recent_images", True)
         self._show_recent_images_allow_gif = self._cfg_bool("show_recent_images_allow_gif", False)
         self._image_context_window = max(1, self._cfg_int("image_context_window", 20))
+        self._voice_context_window = max(0, self._cfg_int("voice_context_window", 50))
         self._builtin_ltm_warned: set[str] = set()
 
         # 图像转述配置
@@ -1328,7 +1360,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.1.5"
+        version = "3.1.6"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -1896,6 +1928,11 @@ class Main(star.Star):
                 if self._image_context_window > 0
                 else flow_source
             )
+            voice_flow = (
+                flow_source[-self._voice_context_window:]
+                if self._voice_context_window > 0
+                else []
+            )
 
             now = time.time()
             bot_status: dict[str, float | str | bool] = {}
@@ -1921,6 +1958,7 @@ class Main(star.Star):
                 show_recent_images=self._show_recent_images,
                 show_recent_gifs=self._show_recent_images_allow_gif,
                 image_flow=image_flow,
+                voice_flow=voice_flow,
             )
 
             # 注入场景描述到请求（v3.0.0: 防止重复注入）

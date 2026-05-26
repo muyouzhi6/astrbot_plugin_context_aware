@@ -215,6 +215,98 @@ class ContextAwareGeminiSTTTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(voice_messages), 1)
         self.assertEqual(plugin._stats.messages_recorded, 1)
 
+    def test_scene_generator_injects_recent_voice_transcripts_outside_dialogue_flow(self):
+        generator = self.mod.SceneGenerator()
+        current = self.mod.MessageRecord(
+            msg_id="current",
+            sender_id="100",
+            sender_name="Alice",
+            content="@bot 更早的一条呢",
+            timestamp=100.0,
+            at_bot=True,
+            talking_to="bot",
+        )
+        voice = self.mod.MessageRecord(
+            msg_id="voice",
+            sender_id="100",
+            sender_name="Alice",
+            content="[语音转写] 我想测一下唱歌识别",
+            timestamp=1.0,
+        )
+        recent = self.mod.MessageRecord(
+            msg_id="recent",
+            sender_id="101",
+            sender_name="Bob",
+            content="普通聊天",
+            timestamp=99.0,
+        )
+
+        scene = generator.generate(
+            trigger_type=self.mod.TRIGGER_AT,
+            trigger_desc="被@",
+            current=current,
+            flow=[recent, current],
+            voice_flow=[voice, recent, current],
+            bot_status={},
+            participants=["Alice", "Bob"],
+        )
+
+        self.assertIn("<recent_voice_transcripts>", scene)
+        self.assertIn("[语音转写] 我想测一下唱歌识别", scene)
+
+    async def test_on_llm_request_keeps_voice_transcript_from_larger_window(self):
+        plugin = self.mod.Main(
+            FakeContext(),
+            {
+                "enable": True,
+                "only_group_chat": True,
+                "dialogue_window": 3,
+                "voice_context_window": 20,
+            },
+        )
+        event = FakeEvent()
+        req = self.mod.ProviderRequest()
+
+        records = [
+            self.mod.MessageRecord(
+                msg_id="voice",
+                sender_id="100",
+                sender_name="Alice",
+                content="[语音转写] 我想测一下唱歌识别",
+                timestamp=1.0,
+            )
+        ]
+        for i in range(10):
+            records.append(
+                self.mod.MessageRecord(
+                    msg_id=f"filler-{i}",
+                    sender_id=str(200 + i),
+                    sender_name=f"User{i}",
+                    content=f"普通聊天 {i}",
+                    timestamp=2.0 + i,
+                )
+            )
+        records.append(
+            self.mod.MessageRecord(
+                msg_id="current",
+                sender_id="100",
+                sender_name="Alice",
+                content="@bot 更早的一条呢",
+                timestamp=20.0,
+                at_bot=True,
+                talking_to="bot",
+            )
+        )
+        for record in records:
+            await plugin._sessions.add_message_async(event.unified_msg_origin, record)
+
+        await plugin.on_llm_request(event, req)
+
+        self.assertTrue(req.extra_user_content_parts)
+        scene = req.extra_user_content_parts[-1].text
+        self.assertIn("<recent_voice_transcripts>", scene)
+        self.assertIn("[语音转写] 我想测一下唱歌识别", scene)
+
 
 if __name__ == "__main__":
     unittest.main()
