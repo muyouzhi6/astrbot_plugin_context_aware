@@ -307,6 +307,83 @@ class ContextAwareGeminiSTTTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<recent_voice_transcripts>", scene)
         self.assertIn("[语音转写] 我想测一下唱歌识别", scene)
 
+    async def test_lazy_caption_skips_placeholder_for_filtered_gif(self):
+        plugin = self.mod.Main(
+            FakeContext(),
+            {
+                "enable": True,
+                "image_caption": True,
+                "image_caption_lazy": True,
+                "show_recent_images_allow_gif": False,
+            },
+        )
+        calls: list[str] = []
+
+        async def fake_caption(url: str):
+            calls.append(url)
+            return "普通图片描述"
+
+        plugin._get_image_caption = fake_caption
+        message = self.mod.MessageRecord(
+            msg_id="img",
+            sender_id="100",
+            sender_name="Alice",
+            content="[图片][图片]",
+            timestamp=1.0,
+            has_image=True,
+            image_count=2,
+            has_gif=True,
+            gif_count=1,
+            image_urls=["https://example.com/a.gif", "https://example.com/b.jpg"],
+        )
+
+        updated = await plugin._lazy_caption_flow([message])
+
+        self.assertEqual(calls, ["https://example.com/b.jpg"])
+        self.assertEqual(updated[0].content, "[图片][图片: 普通图片描述]")
+
+    async def test_on_llm_request_does_not_lazy_caption_when_recent_images_hidden(self):
+        plugin = self.mod.Main(
+            FakeContext(),
+            {
+                "enable": True,
+                "only_group_chat": True,
+                "image_caption": True,
+                "image_caption_lazy": True,
+                "show_recent_images": False,
+            },
+        )
+        event = FakeEvent()
+        req = self.mod.ProviderRequest()
+        calls: list[str] = []
+
+        async def fake_caption(url: str):
+            calls.append(url)
+            return "不应生成"
+
+        plugin._get_image_caption = fake_caption
+        await plugin._sessions.add_message_async(
+            event.unified_msg_origin,
+            self.mod.MessageRecord(
+                msg_id="current",
+                sender_id="100",
+                sender_name="Alice",
+                content="@bot [图片]",
+                timestamp=1.0,
+                at_bot=True,
+                talking_to="bot",
+                has_image=True,
+                image_count=1,
+                image_urls=["https://example.com/image.jpg"],
+            ),
+        )
+
+        await plugin.on_llm_request(event, req)
+
+        self.assertEqual(calls, [])
+        scene = req.extra_user_content_parts[-1].text
+        self.assertNotIn("<recent_images>", scene)
+
 
 if __name__ == "__main__":
     unittest.main()

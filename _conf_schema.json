@@ -90,6 +90,15 @@
     "default": false,
     "hint": "启用后每张图片会调用一次LLM，会产生额外费用和延迟"
   },
+  "image_caption_lazy": {
+    "description": "延迟图像转述",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后图片不会在到达时立即描述，而是在 LLM 准备回复时才描述窗口内的图片，避免无效调用；会略微增加回复延迟",
+    "condition": {
+      "image_caption": true
+    }
+  },
   "image_caption_provider_id": {
     "description": "图像转述使用的提供商",
     "type": "string",
@@ -117,6 +126,40 @@
     "hint": "本地模型或慢速API建议设置更长时间（如120-300秒）",
     "condition": {
       "image_caption": true
+    }
+  },
+  "image_cache_dir": {
+    "description": "图片本地缓存目录（lazy 模式提前下载用）",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动使用 AstrBot plugin_data/astrbot_plugin_context_aware/cached_images。收到图片时先下载到此目录，有需要时再送视觉模型。",
+    "condition": {
+      "image_caption": true,
+      "image_caption_lazy": true
+    }
+  },
+  "image_download_max_bytes": {
+    "description": "图片缓存下载大小上限（字节）",
+    "type": "int",
+    "default": 52428800,
+    "min": 1,
+    "max": 104857600,
+    "hint": "超过此大小的图片不会被缓存下载，默认 50MB",
+    "condition": {
+      "image_caption": true,
+      "image_caption_lazy": true
+    }
+  },
+  "image_cache_ttl": {
+    "description": "缓存文件保留时间（秒）",
+    "type": "int",
+    "default": 3600,
+    "min": 60,
+    "max": 604800,
+    "hint": "超过此时间的缓存文件会在插件启动时、后台任务及运行中下载图片前被清理，默认3600秒（1小时）",
+    "condition": {
+      "image_caption": true,
+      "image_caption_lazy": true
     }
   },
   "history_compress_strategy": {
