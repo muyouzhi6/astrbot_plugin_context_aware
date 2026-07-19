@@ -155,6 +155,11 @@ DEFAULT_REPLY_STARTERS: Final = frozenset({
 })
 
 IMAGE_CACHE_CLEANUP_INTERVAL: Final = 60
+IMAGE_CACHE_PREFIX: Final = "context-aware-"
+IMAGE_CACHE_FILENAME_RE = re.compile(
+    rf"{re.escape(IMAGE_CACHE_PREFIX)}[0-9a-f]{{32}}\.(?:jpg|jpeg|png|gif|webp|bmp|ico)",
+    re.IGNORECASE,
+)
 
 
 # ============================================================================
@@ -1693,6 +1698,8 @@ class Main(star.Star):
         total_size = 0
         try:
             for fname in os.listdir(self._image_cache_dir):
+                if IMAGE_CACHE_FILENAME_RE.fullmatch(fname) is None:
+                    continue
                 fpath = os.path.join(self._image_cache_dir, fname)
                 if not os.path.isfile(fpath):
                     continue
@@ -1757,7 +1764,9 @@ class Main(star.Star):
                 _, ext = os.path.splitext(image_url)
                 if not ext:
                     ext = ".jpg"
-                cached_path = os.path.join(self._image_cache_dir, f"{url_hash}{ext}")
+                cached_path = os.path.join(
+                    self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
+                )
                 if not os.path.exists(cached_path):
                     import shutil
                     try:
@@ -1791,7 +1800,9 @@ class Main(star.Star):
         elif ".webp" in lower_url:
             ext = ".webp"
 
-        local_path = os.path.join(self._image_cache_dir, f"{url_hash}{ext}")
+        local_path = os.path.join(
+            self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
+        )
 
         if os.path.exists(local_path):
             self._image_download_cache[image_url] = local_path

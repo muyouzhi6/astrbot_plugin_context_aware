@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -179,6 +181,25 @@ class FakeEvent:
 class ContextAwareGeminiSTTTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.mod = load_plugin_module()
+
+    def test_image_cache_cleanup_keeps_unrelated_old_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache_dir = Path(root)
+            plugin = self.mod.Main(
+                FakeContext(),
+                {"image_cache_dir": str(cache_dir), "image_cache_ttl": 60},
+            )
+            cached = cache_dir / f"{self.mod.IMAGE_CACHE_PREFIX}{'a' * 32}.jpg"
+            unrelated = cache_dir / "old.jpg"
+            cached.write_bytes(b"cached")
+            unrelated.write_bytes(b"unrelated")
+            os.utime(cached, (0, 0))
+            os.utime(unrelated, (0, 0))
+
+            plugin._cleanup_image_cache(force=True)
+
+            self.assertFalse(cached.exists())
+            self.assertTrue(unrelated.exists())
 
     async def test_gemini_stt_transcript_is_recorded_as_message(self):
         plugin = self.mod.Main(FakeContext(), {"enable": True, "only_group_chat": True})
