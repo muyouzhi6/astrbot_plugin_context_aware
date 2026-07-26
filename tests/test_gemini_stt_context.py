@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -180,6 +182,25 @@ class ContextAwareGeminiSTTTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.mod = load_plugin_module()
 
+    def test_image_cache_cleanup_keeps_unrelated_old_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            cache_dir = Path(root)
+            plugin = self.mod.Main(
+                FakeContext(),
+                {"image_cache_dir": str(cache_dir), "image_cache_ttl": 60},
+            )
+            cached = cache_dir / f"{self.mod.IMAGE_CACHE_PREFIX}{'a' * 32}.jpg"
+            unrelated = cache_dir / "old.jpg"
+            cached.write_bytes(b"cached")
+            unrelated.write_bytes(b"unrelated")
+            os.utime(cached, (0, 0))
+            os.utime(unrelated, (0, 0))
+
+            plugin._cleanup_image_cache(force=True)
+
+            self.assertFalse(cached.exists())
+            self.assertTrue(unrelated.exists())
+
     async def test_gemini_stt_transcript_is_recorded_as_message(self):
         plugin = self.mod.Main(FakeContext(), {"enable": True, "only_group_chat": True})
         event = FakeEvent()
@@ -306,6 +327,83 @@ class ContextAwareGeminiSTTTest(unittest.IsolatedAsyncioTestCase):
         scene = req.extra_user_content_parts[-1].text
         self.assertIn("<recent_voice_transcripts>", scene)
         self.assertIn("[语音转写] 我想测一下唱歌识别", scene)
+
+    async def test_lazy_caption_skips_placeholder_for_filtered_gif(self):
+        plugin = self.mod.Main(
+            FakeContext(),
+            {
+                "enable": True,
+                "image_caption": True,
+                "image_caption_lazy": True,
+                "show_recent_images_allow_gif": False,
+            },
+        )
+        calls: list[str] = []
+
+        async def fake_caption(url: str):
+            calls.append(url)
+            return "普通图片描述"
+
+        plugin._get_image_caption = fake_caption
+        message = self.mod.MessageRecord(
+            msg_id="img",
+            sender_id="100",
+            sender_name="Alice",
+            content="[图片][图片]",
+            timestamp=1.0,
+            has_image=True,
+            image_count=2,
+            has_gif=True,
+            gif_count=1,
+            image_urls=["https://example.com/a.gif", "https://example.com/b.jpg"],
+        )
+
+        updated = await plugin._lazy_caption_flow([message])
+
+        self.assertEqual(calls, ["https://example.com/b.jpg"])
+        self.assertEqual(updated[0].content, "[图片][图片: 普通图片描述]")
+
+    async def test_on_llm_request_does_not_lazy_caption_when_recent_images_hidden(self):
+        plugin = self.mod.Main(
+            FakeContext(),
+            {
+                "enable": True,
+                "only_group_chat": True,
+                "image_caption": True,
+                "image_caption_lazy": True,
+                "show_recent_images": False,
+            },
+        )
+        event = FakeEvent()
+        req = self.mod.ProviderRequest()
+        calls: list[str] = []
+
+        async def fake_caption(url: str):
+            calls.append(url)
+            return "不应生成"
+
+        plugin._get_image_caption = fake_caption
+        await plugin._sessions.add_message_async(
+            event.unified_msg_origin,
+            self.mod.MessageRecord(
+                msg_id="current",
+                sender_id="100",
+                sender_name="Alice",
+                content="@bot [图片]",
+                timestamp=1.0,
+                at_bot=True,
+                talking_to="bot",
+                has_image=True,
+                image_count=1,
+                image_urls=["https://example.com/image.jpg"],
+            ),
+        )
+
+        await plugin.on_llm_request(event, req)
+
+        self.assertEqual(calls, [])
+        scene = req.extra_user_content_parts[-1].text
+        self.assertNotIn("<recent_images>", scene)
 
 
 if __name__ == "__main__":

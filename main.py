@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.2.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.3.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -16,64 +16,36 @@ AstrBot 上下文场景感知增强插件 v3.2.0 (Context-Aware Enhancement)
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
 
+v3.3.0 更新:
+- [FEAT] 新增 lazy 图像转述模式（image_caption_lazy）：图片到达时仅记录占位，
+  只在 LLM 真正需要用到该图片时才调用视觉模型，避免 90% 无效调用
+- [FEAT] 新增图片本地缓存（image_cache_dir / image_download_max_bytes / image_cache_ttl）：
+  收到图片时提前下载到本地，防止 QQ CDN 等临时链接在 lazy caption 阶段过期失效
+- [FEAT] 图片转 data URI 后送视觉模型，进一步提升链接稳定性
+- [FIX] _get_image_caption 增加失败哨兵缓存，避免对同一失败 URL 反复重试
+
 v3.2.0 更新:
 - [FIX] 收紧规则4时间窗口（35s→20s），降低高频群聊中短确认词误判为回复Bot的概率
-- [FIX] 规则4新增"他人正在对话中"保护：若最近有其他人主动在和当前用户说话，不推断为回复Bot
-- [REMOVE] 删除规则6（快速连续对话推断）：该规则增加推断复杂度，在群聊中易产生误导
-- [FIX] 强化 TRIGGER_ACTIVE + talking_to=bot 的 instruction，LLM 现在会更保守地判断是否需要回复
-- [FIX] Gemini_STT 的 cache_only / should_reply=False 消息在 on_message 入口即过滤，不再记录
-- [CONFIG] 新增 strict_mode：开启后主动触发场景下强制不推断 talking_to=bot，彻底减少误回复
-
-v3.1.6 更新:
-- [FIX] 语音转写独立上下文窗口，避免高频群聊把未回复语音挤出最近对话流
-
-v3.1.5 更新:
-- [FIX] 兼容 Gemini_STT 语音转写上下文，记录为普通群聊消息
-- [FIX] 按消息 ID 幂等写入，避免 LLM 请求兜底记录和消息 handler 重复记录同一条语音
-
-v3.1.4 更新:
-- [FIX] 最近图片上下文支持过滤 GIF，避免不支持 image/gif 的模型在后续请求中报错
-- [CONFIG] 新增 show_recent_images_allow_gif 开关，默认不将 GIF 加入 <recent_images>
-
-v3.1.3 更新:
-- [FIX] 图片上下文记录只扩展到图片概要，避免纯表情/@/引用等占位消息污染对话流
-- [CHANGE] 最低 AstrBot 版本提高到 4.24.0，确保临时注入不会写入会话历史
-
-v3.1.2 更新:
-- [FIX] 唤醒词判定改为显式匹配 wake_prefix，避免把异常触发误判成 wake_word
-- [FIX] 多个 @ 对象时保留完整对话目标，避免只显示第一个人
-
-v3.1.1 更新:
-- [FIX] 修复 SessionState 字段重复定义问题
-- [FIX] 修复超时配置代码(300s)与schema(600s)不一致
-- [FIX] 修复 Bot 消息 ID 使用时间戳可能冲突，改用 uuid
-
-v3.0.0 更新 (重大重构):
-- [CRITICAL] 修复并发竞态: SessionManager 添加异步锁 + deque 替代 list
-- [HIGH] 图像转述优化: 并发限流(Semaphore) + 超时控制 + URL缓存
-- [HIGH] 修复封装破坏: SceneAnalyzer 添加 bot_id 只读属性
-- [HIGH] 消除魔法字符串: 集中定义 ExtraKeys 常量类
-- [HIGH] 安全注入场景: 防止重复注入 + 兼容处理
-- [HIGH] 对话推断增强: 关键锚点分离 + 推断原因追踪
-- [MEDIUM] 配置工具方法: _cfg_int/_cfg_bool/_cfg_list
-- [MEDIUM] 回复特征词可配置化
-- [MEDIUM] 增强可观测性: 推断规则日志
-- [LOW] 修复时间戳精度: 使用 uuid
-
-v2.5.1 更新:
-- 新增戳一戳触发类型（TRIGGER_POKE）
-- 支持 poke_to_llm 插件的 _poke_trigger 标记
-- 戳一戳时正确显示戳一戳用户信息
+- [FIX] 规则4新增"他人正在对话中"保护：最近60s内有其他用户主动和当前发言者说话时，不推断为回复Bot
+- [REMOVE] 删除规则6（快速连续对话推断），该规则在群聊中弊大于利
+- [FIX] 强化 TRIGGER_ACTIVE + talking_to=bot 场景的 instruction
+- [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.2.0
+Version: 3.3.0
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import mimetypes
+import os
 import re
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
@@ -85,6 +57,12 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
 from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
+
+try:
+    from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+except Exception:
+    def get_astrbot_plugin_data_path() -> str:
+        return os.path.join(os.getcwd(), "plugin_data")
 
 if TYPE_CHECKING:
     from astrbot.core.config import AstrBotConfig
@@ -150,6 +128,13 @@ DEFAULT_REPLY_STARTERS: Final = frozenset({
     "ok", "OK", "Ok", "好滴", "好哒", "好嘞", "okok",
 })
 
+IMAGE_CACHE_CLEANUP_INTERVAL: Final = 60
+IMAGE_CACHE_PREFIX: Final = "context-aware-"
+IMAGE_CACHE_FILENAME_RE = re.compile(
+    rf"{re.escape(IMAGE_CACHE_PREFIX)}[0-9a-f]{{32}}\.(?:jpg|jpeg|png|gif|webp|bmp|ico)",
+    re.IGNORECASE,
+)
+
 
 # ============================================================================
 # Inference Reasons - 推断原因追踪
@@ -195,6 +180,8 @@ class MessageRecord:
     image_count: int = 0
     has_gif: bool = False
     gif_count: int = 0
+    image_urls: list[str] = field(default_factory=list)
+    image_local_paths: list[str] = field(default_factory=list)
 
 
 def _normalize_at_target(
@@ -1335,6 +1322,7 @@ class Main(star.Star):
 
         # 图像转述配置
         self._image_caption_enabled = self._cfg_bool("image_caption", False)
+        self._image_caption_lazy = self._cfg_bool("image_caption_lazy", False)
         self._image_caption_provider_id = str(self._cfg("image_caption_provider_id", "") or "")
         self._image_caption_prompt = str(
             self._cfg("image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。") or ""
@@ -1344,6 +1332,33 @@ class Main(star.Star):
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
         self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
         self._image_caption_cache_max = 100  # 硬上限
+        # 图片本地缓存目录（lazy 模式提前下载用）
+        default_cache_dir = os.path.join(
+            get_astrbot_plugin_data_path(),
+            "astrbot_plugin_context_aware",
+            "cached_images",
+        )
+        self._image_cache_dir = os.path.expanduser(
+            str(self._cfg("image_cache_dir", default_cache_dir) or default_cache_dir)
+        )
+        try:
+            os.makedirs(self._image_cache_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[ContextAware] 无法创建图片缓存目录 {self._image_cache_dir}: {e}")
+            self._image_cache_dir = ""
+        self._image_download_cache: dict[str, str | None] = {}  # URL -> local_path_or_None
+        # 缓存下载大小上限（50MB）
+        self._image_download_max_bytes = max(
+            1, self._cfg_int("image_download_max_bytes", 50 * 1024 * 1024)
+        )
+        # 缓存文件保留时间（秒），默认 1 小时；启动时、后台任务和下载前都会清理过期文件
+        self._image_cache_ttl = max(
+            60, self._cfg_int("image_cache_ttl", 3600)
+        )
+        self._last_image_cache_cleanup = 0.0
+        self._image_cache_cleanup_task: asyncio.Task | None = None
+        self._cleanup_image_cache(force=True)
+        self._start_image_cache_cleanup_task()
         # 用户可配置超时（范围校验：10-600秒，与 schema 对齐）
         _timeout_cfg = self._cfg_int("image_caption_timeout", 60)
         if _timeout_cfg < 10 or _timeout_cfg > 600:
@@ -1371,8 +1386,10 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.2.0"
+        version = "3.3.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
+        if self._image_caption_enabled and self._image_caption_lazy:
+            caption_status += "（lazy 模式）"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -1636,18 +1653,257 @@ class Main(star.Star):
             await self._sessions.clear_compressing_async(umo)
             return snapshot
 
+    def _mark_url_failed(self, image_url: str) -> None:
+        """缓存失败的URL（用空字符串作为哨兵），避免后续对同一URL重复请求"""
+        self._image_caption_cache[image_url] = ""
+        while len(self._image_caption_cache) > self._image_caption_cache_max:
+            self._image_caption_cache.popitem(last=False)
+
+    def _cleanup_image_cache(self, force: bool = False) -> None:
+        """清理过期缓存文件，运行中按固定间隔限频触发。"""
+        if not self._image_cache_dir or not os.path.isdir(self._image_cache_dir):
+            return
+        now = time.time()
+        if (
+            not force
+            and now - self._last_image_cache_cleanup < IMAGE_CACHE_CLEANUP_INTERVAL
+        ):
+            return
+        self._last_image_cache_cleanup = now
+        cutoff = now - self._image_cache_ttl
+        removed = 0
+        total_size = 0
+        try:
+            for fname in os.listdir(self._image_cache_dir):
+                if IMAGE_CACHE_FILENAME_RE.fullmatch(fname) is None:
+                    continue
+                fpath = os.path.join(self._image_cache_dir, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                size = os.path.getsize(fpath)
+                mtime = os.path.getmtime(fpath)
+                if mtime < cutoff:
+                    try:
+                        os.remove(fpath)
+                        removed += 1
+                    except Exception:
+                        pass
+                    continue
+                total_size += size
+            logger.info(
+                f"[ContextAware] 缓存清理: 移除 {removed} 个过期文件, "
+                f"剩余 {total_size / 1024:.0f} KB"
+            )
+        except Exception as e:
+            logger.warning(f"[ContextAware] 缓存清理异常: {e}")
+
+    def _start_image_cache_cleanup_task(self) -> None:
+        """启动图片缓存后台清理任务；无事件循环时可稍后重试。"""
+        if (
+            self._image_cache_cleanup_task
+            or not self._image_cache_dir
+            or not self._image_caption_enabled
+            or not self._image_caption_lazy
+        ):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            self._image_cache_cleanup_task = loop.create_task(
+                self._image_cache_cleanup_loop()
+            )
+        except RuntimeError:
+            logger.debug("[ContextAware] 当前无运行中的事件循环，跳过图片缓存后台清理任务")
+
+    async def _image_cache_cleanup_loop(self) -> None:
+        """后台定期清理图片缓存，让 TTL 在长期运行时持续生效。"""
+        while True:
+            await asyncio.sleep(IMAGE_CACHE_CLEANUP_INTERVAL)
+            self._cleanup_image_cache(force=True)
+
+    async def _download_image_to_local(self, image_url: str) -> str | None:
+        """下载图片到本地缓存目录，返回本地文件路径。
+
+        如果 image_url 已经是本地路径（AstrBot 框架已缓存），直接使用。
+        如果是远程 http URL，下载到缓存目录。
+        """
+        if not image_url:
+            return None
+
+        self._start_image_cache_cleanup_task()
+        self._cleanup_image_cache()
+
+        # 已经是本地文件路径：复制到缓存目录持久化，避免被临时文件清理删掉
+        if not image_url.startswith("http"):
+            if os.path.exists(image_url):
+                if not self._image_cache_dir:
+                    return image_url
+                url_hash = hashlib.md5(image_url.encode()).hexdigest()
+                _, ext = os.path.splitext(image_url)
+                if not ext:
+                    ext = ".jpg"
+                cached_path = os.path.join(
+                    self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
+                )
+                if not os.path.exists(cached_path):
+                    import shutil
+                    try:
+                        shutil.copy2(image_url, cached_path)
+                    except Exception:
+                        return image_url  # fallback 到原路径
+                return cached_path
+            return None
+
+        if not self._image_cache_dir:
+            return None
+
+        # 检查是否已下载过
+        if image_url in self._image_download_cache:
+            cached = self._image_download_cache[image_url]
+            if cached and os.path.exists(cached):
+                return cached
+            if cached:
+                self._image_download_cache.pop(image_url, None)
+            else:
+                return None
+
+        # 生成缓存文件名
+        url_hash = hashlib.md5(image_url.encode()).hexdigest()
+        ext = ".jpg"
+        lower_url = image_url.lower()
+        if ".png" in lower_url:
+            ext = ".png"
+        elif ".gif" in lower_url:
+            ext = ".gif"
+        elif ".webp" in lower_url:
+            ext = ".webp"
+
+        local_path = os.path.join(
+            self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
+        )
+
+        if os.path.exists(local_path):
+            self._image_download_cache[image_url] = local_path
+            return local_path
+
+        try:
+            content_size = await asyncio.to_thread(
+                self._download_remote_image_sync,
+                image_url,
+                local_path,
+            )
+            if content_size is None:
+                self._image_download_cache[image_url] = None
+                return None
+            self._image_download_cache[image_url] = local_path
+            logger.info(
+                f"[ContextAware] 图片已缓存到本地 ({content_size} bytes): "
+                f"{os.path.basename(local_path)}"
+            )
+            return local_path
+        except Exception as e:
+            logger.warning(f"[ContextAware] 图片下载异常: {e}")
+            self._image_download_cache[image_url] = None
+            return None
+
+    def _download_remote_image_sync(self, image_url: str, local_path: str) -> int | None:
+        """同步下载远程图片；由 asyncio.to_thread 调用，避免阻塞事件循环。"""
+        def cleanup_partial() -> None:
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/134.0.0.0 Safari/537.36"
+            ),
+        }
+        req = urllib.request.Request(image_url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                status = getattr(resp, "status", 200)
+                if status != 200:
+                    logger.warning(
+                        f"[ContextAware] 图片下载失败 HTTP {status}: {image_url[:60]}..."
+                    )
+                    return None
+
+                content_length = resp.headers.get("Content-Length")
+                if content_length:
+                    try:
+                        cl = int(content_length)
+                    except ValueError:
+                        cl = None
+                    if cl is not None and cl > self._image_download_max_bytes:
+                        logger.warning(
+                            f"[ContextAware] 图片过大 ({cl} bytes)，跳过缓存: {image_url[:60]}..."
+                        )
+                        return None
+
+                total = 0
+                with open(local_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > self._image_download_max_bytes:
+                            logger.warning(
+                                f"[ContextAware] 图片下载超过上限 "
+                                f"({self._image_download_max_bytes} bytes)，已中止: "
+                                f"{image_url[:60]}..."
+                            )
+                            cleanup_partial()
+                            return None
+                        f.write(chunk)
+                if total <= 0:
+                    cleanup_partial()
+                    return None
+                return total
+        except urllib.error.HTTPError as e:
+            cleanup_partial()
+            logger.warning(
+                f"[ContextAware] 图片下载失败 HTTP {e.code}: {image_url[:60]}..."
+            )
+            return None
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            cleanup_partial()
+            logger.warning(f"[ContextAware] 图片下载异常: {e}")
+            return None
+
+    @staticmethod
+    def _local_path_to_data_uri(local_path: str) -> str | None:
+        """将本地图片文件转为 data URI。"""
+        if not os.path.exists(local_path):
+            return None
+        try:
+            with open(local_path, "rb") as f:
+                raw = f.read()
+            mime_type, _ = mimetypes.guess_type(local_path)
+            if not mime_type:
+                mime_type = "image/jpeg"
+            b64 = base64.b64encode(raw).decode("ascii")
+            return f"data:{mime_type};base64,{b64}"
+        except Exception as e:
+            logger.warning(f"[ContextAware] 图片转 data URI 失败: {e}")
+            return None
+
     async def _get_image_caption(self, image_url: str) -> str | None:
         """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
         if not self._image_caption_enabled:
             return None
 
-        # 缓存命中检查
+        # 缓存命中检查：空字符串为上次失败的哨兵
         if image_url in self._image_caption_cache:
             self._image_caption_cache_hits += 1
-            # 移动到末尾（LRU 更新）
             self._image_caption_cache.move_to_end(image_url)
-            return self._image_caption_cache[image_url]
+            cached = self._image_caption_cache[image_url]
+            return cached if cached else None
 
+        t0 = time.perf_counter()
         try:
             # 并发限流
             async with self._image_caption_semaphore:
@@ -1677,11 +1933,14 @@ class Main(star.Star):
                         timeout=self._image_caption_timeout
                     )
                 except asyncio.TimeoutError:
+                    elapsed = time.perf_counter() - t0
                     self._image_caption_errors += 1
-                    logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s)")
+                    logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s, 耗时 {elapsed:.1f}s)")
+                    self._mark_url_failed(image_url)  # 防重试
                     return None
 
                 if response and response.completion_text:
+                    elapsed = time.perf_counter() - t0
                     self._image_caption_count += 1
                     caption = response.completion_text.strip()
                     # 限制长度
@@ -1692,14 +1951,92 @@ class Main(star.Star):
                     # LRU 淘汰：超过硬上限时移除最旧的
                     while len(self._image_caption_cache) > self._image_caption_cache_max:
                         self._image_caption_cache.popitem(last=False)
-                    logger.debug(f"[ContextAware] 图像转述成功: {caption[:30]}...")
+                    logger.info(f"[ContextAware] 图像转述完成 ({elapsed:.1f}s) | {caption[:40]}...")
                     return caption
 
+                # LLM返回空响应（如图片被核心静默丢弃等），标记失败
+                self._mark_url_failed(image_url)
+                return None
+
         except Exception as e:
+            elapsed = time.perf_counter() - t0
             self._image_caption_errors += 1
-            logger.error(f"[ContextAware] 图像转述失败: {e}")
+            logger.error(f"[ContextAware] 图像转述失败 ({elapsed:.1f}s): {e}")
+            self._mark_url_failed(image_url)
 
         return None
+
+    async def _lazy_caption_flow(
+        self, messages: list[MessageRecord]
+    ) -> list[MessageRecord]:
+        """延迟图像转述：对 image_flow 中尚未描述的图片进行转述（在 LLM 请求时触发）"""
+        if not self._image_caption_enabled or not self._image_caption_lazy or not messages:
+            return messages
+
+        updated: list[MessageRecord] = []
+        for msg in messages:
+            if not msg.image_urls:
+                updated.append(msg)
+                continue
+            # 检查 content 是否已有描述
+            if "[图片: " in msg.content:
+                updated.append(msg)
+                continue
+            # 有未描述的图片，逐一转述
+            new_content = msg.content
+            caption_index = 0
+            for img_idx, url in enumerate(msg.image_urls):
+                is_gif = _image_ref_looks_like_gif(url)
+                if is_gif and not self._show_recent_images_allow_gif:
+                    idx = new_content.find("[图片]", caption_index)
+                    if idx >= 0:
+                        caption_index = idx + 4
+                    continue
+
+                # 优先使用本地缓存路径（data URI 替代原始 URL）
+                input_url = url
+                if msg.image_local_paths and img_idx < len(msg.image_local_paths):
+                    local_path = msg.image_local_paths[img_idx]
+                    if local_path and os.path.exists(local_path):
+                        data_uri = self._local_path_to_data_uri(local_path)
+                        if data_uri:
+                            input_url = data_uri
+
+                caption = await self._get_image_caption(input_url)
+                if caption:
+                    # 替换 content 中对应位置的 [图片] 标记
+                    # 按顺序替换，每次替换第一个 [图片] 标记
+                    idx = new_content.find("[图片]", caption_index)
+                    if idx >= 0:
+                        new_content = new_content[:idx] + f"[图片: {caption}]" + new_content[idx + 4:]
+                        caption_index = idx + len(f"[图片: {caption}]")
+                    else:
+                        new_content += f" | [图片: {caption}]"
+            if new_content != msg.content:
+                updated.append(MessageRecord(
+                    msg_id=msg.msg_id,
+                    sender_id=msg.sender_id,
+                    sender_name=msg.sender_name,
+                    content=new_content[:500],
+                    timestamp=msg.timestamp,
+                    is_bot=msg.is_bot,
+                    at_bot=msg.at_bot,
+                    at_all=msg.at_all,
+                    reply_to_id=msg.reply_to_id,
+                    talking_to=msg.talking_to,
+                    talking_to_name=msg.talking_to_name,
+                    at_targets=list(msg.at_targets),
+                    message_outline=msg.message_outline,
+                    has_image=msg.has_image,
+                    image_count=msg.image_count,
+                    has_gif=msg.has_gif,
+                    gif_count=msg.gif_count,
+                    image_urls=list(msg.image_urls),
+                    image_local_paths=list(msg.image_local_paths),
+                ))
+            else:
+                updated.append(msg)
+        return updated
 
     async def _extract_message_with_caption(
         self, event: AstrMessageEvent
@@ -1709,6 +2046,8 @@ class Main(star.Star):
 
         sender_id = event.get_sender_id()
         parts: list[str] = []
+        collected_image_urls: list[str] = []
+        collected_local_paths: list[str] = []
         message_outline = _event_message_outline(event)
         voice_transcript = _event_voice_transcript(event)
         image_count = 0
@@ -1727,11 +2066,13 @@ class Main(star.Star):
             elif isinstance(comp, Image):
                 image_count += 1
                 image_url = SceneAnalyzer._image_ref_from_component(comp)
+                if image_url:
+                    collected_image_urls.append(image_url)
                 is_gif = _image_ref_looks_like_gif(image_url)
                 if is_gif:
                     gif_count += 1
-                # 尝试图像转述
-                if self._image_caption_enabled and (
+                # 尝试图像转述（非 lazy 模式才在消息到达时描述）
+                if self._image_caption_enabled and not self._image_caption_lazy and (
                     not is_gif or self._show_recent_images_allow_gif
                 ):
                     if image_url:
@@ -1743,6 +2084,19 @@ class Main(star.Star):
                     else:
                         parts.append("[图片]")
                 else:
+                    # lazy 模式：下载图片到本地缓存，后续识图走本地文件
+                    # 但如果是不允许转述的 GIF，跳过下载（下了也用不到）
+                    should_download = (
+                        image_url
+                        and self._image_caption_enabled
+                        and self._image_caption_lazy
+                        and (not is_gif or self._show_recent_images_allow_gif)
+                    )
+                    if should_download:
+                        local_path = await self._download_image_to_local(image_url)
+                        collected_local_paths.append(local_path or "")
+                    else:
+                        collected_local_paths.append("")  # placeholder
                     parts.append("[图片]")
 
         has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
@@ -1762,6 +2116,8 @@ class Main(star.Star):
             image_count=max(image_count, 1 if has_image else 0),
             has_gif=gif_count > 0,
             gif_count=gif_count,
+            image_urls=collected_image_urls,
+            image_local_paths=collected_local_paths,
         )
 
         # 提取 @ 和回复信息
@@ -1954,6 +2310,15 @@ class Main(star.Star):
                 if self._voice_context_window > 0
                 else []
             )
+
+            # lazy 模式：在生成场景前对窗口内的图片进行转述
+            if (
+                self._show_recent_images
+                and self._image_caption_enabled
+                and self._image_caption_lazy
+                and image_flow
+            ):
+                image_flow = await self._lazy_caption_flow(image_flow)
 
             now = time.time()
             bot_status: dict[str, float | str | bool] = {}
@@ -2201,6 +2566,14 @@ class Main(star.Star):
 
     async def terminate(self) -> None:
         """清理资源"""
+        if self._image_cache_cleanup_task:
+            self._image_cache_cleanup_task.cancel()
+            try:
+                await self._image_cache_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._image_cache_cleanup_task = None
+
         # 输出最终统计
         trigger_summary = ", ".join(
             f"{TRIGGER_NAMES.get(k, k)}: {v}"

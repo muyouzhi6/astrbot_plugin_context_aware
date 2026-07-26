@@ -124,6 +124,9 @@ provider_settings:
 | 配置 | 说明 | 默认值 |
 |------|------|--------|
 | `image_caption` | 启用图像转述 | `false` |
+| `image_caption_lazy` | 延迟图像转述，仅在生成 LLM 回复时转述上下文窗口内的图片 | `false` |
+| `image_cache_dir` | 图片本地缓存目录；留空使用 `plugin_data/astrbot_plugin_context_aware/cached_images` | `""` |
+| `image_cache_ttl` | 图片缓存文件保留时间；启动时、后台任务及运行中下载图片前清理过期文件 | `3600` |
 | `image_caption_provider_id` | 图像转述提供商（下拉选择） | 默认提供商 |
 | `image_caption_prompt` | 图像转述提示词 | `请用中文简洁描述...` |
 
