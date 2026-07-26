@@ -314,13 +314,13 @@ class V320ChangesTest(unittest.TestCase):
         )
 
     def test_version_is_320(self):
-        """插件版本应为 3.3.0（含 lazy caption）"""
+        """插件版本应为 3.3.x"""
         import re
         with open(PLUGIN_PATH, encoding="utf-8") as f:
             content = f.read()
         match = re.search(r'^Version:\s*(\S+)', content, re.MULTILINE)
         self.assertIsNotNone(match, "找不到 Version 字段")
-        self.assertEqual(match.group(1), "3.3.0")
+        self.assertTrue(match.group(1).startswith("3.3."), f"期望 3.3.x，实际: {match.group(1)}")
 
 
 if __name__ == "__main__":

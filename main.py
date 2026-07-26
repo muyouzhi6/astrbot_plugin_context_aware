@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.3.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.3.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,12 @@ AstrBot 上下文场景感知增强插件 v3.3.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.3.1 更新:
+- [FIX] 修复 issue #1：平台以 base64 data URI 传入图片时触发 [Errno 36] File name too long
+  新增 _save_data_uri_to_local：将 data URI 解码落盘后再送给视觉模型，绕过 AstrBot
+  内部将非 http URL 当文件路径处理的逻辑；同时用哈希作为缓存键避免超大 key 占内存
+- [FIX] lazy 模式的 _download_image_to_local 同样支持 data URI 输入
 
 v3.3.0 更新:
 - [FEAT] 新增 lazy 图像转述模式（image_caption_lazy）：图片到达时仅记录占位，
@@ -32,7 +38,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.3.0
+Version: 3.3.1
 """
 
 from __future__ import annotations
@@ -1386,7 +1392,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.3.0"
+        version = "3.3.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -1653,11 +1659,44 @@ class Main(star.Star):
             await self._sessions.clear_compressing_async(umo)
             return snapshot
 
-    def _mark_url_failed(self, image_url: str) -> None:
+    def _mark_url_failed(self, cache_key: str) -> None:
         """缓存失败的URL（用空字符串作为哨兵），避免后续对同一URL重复请求"""
-        self._image_caption_cache[image_url] = ""
+        self._image_caption_cache[cache_key] = ""
         while len(self._image_caption_cache) > self._image_caption_cache_max:
             self._image_caption_cache.popitem(last=False)
+
+    def _save_data_uri_to_local(self, data_uri: str) -> str | None:
+        """将 base64 data URI 解码保存到本地缓存文件，返回本地路径。
+
+        用于处理平台（如 NapCat QQ）直接以 data URI 格式传入图片的场景，
+        避免 AstrBot 内部将超长 data URI 当文件名时触发 [Errno 36] File name too long。
+        """
+        if not self._image_cache_dir or not data_uri.startswith("data:"):
+            return None
+        try:
+            # 格式：data:image/jpeg;base64,/9j/4AA...
+            header, _, encoded = data_uri.partition(",")
+            if not encoded:
+                return None
+            parts = header[5:].split(";")  # 去掉 "data:" 前缀
+            mime_type = parts[0] if parts else "image/jpeg"
+            ext = mimetypes.guess_extension(mime_type) or ".jpg"
+            if ext == ".jpe":  # Python 有时返回 .jpe 而非 .jpg
+                ext = ".jpg"
+
+            # 用编码内容的前512字节做哈希，避免对超大 base64 全量计算
+            url_hash = hashlib.md5(encoded[:512].encode()).hexdigest()
+            local_path = os.path.join(
+                self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
+            )
+            if not os.path.exists(local_path):
+                raw = base64.b64decode(encoded)
+                with open(local_path, "wb") as f:
+                    f.write(raw)
+            return local_path
+        except Exception as e:
+            logger.warning(f"[ContextAware] base64 data URI 保存失败: {e}")
+            return None
 
     def _cleanup_image_cache(self, force: bool = False) -> None:
         """清理过期缓存文件，运行中按固定间隔限频触发。"""
@@ -1724,6 +1763,7 @@ class Main(star.Star):
         """下载图片到本地缓存目录，返回本地文件路径。
 
         如果 image_url 已经是本地路径（AstrBot 框架已缓存），直接使用。
+        如果是 base64 data URI，解码保存到缓存目录。
         如果是远程 http URL，下载到缓存目录。
         """
         if not image_url:
@@ -1731,6 +1771,10 @@ class Main(star.Star):
 
         self._start_image_cache_cleanup_task()
         self._cleanup_image_cache()
+
+        # base64 data URI：解码保存到本地（v3.3.1: 修复 [Errno 36] issue #1）
+        if image_url.startswith("data:"):
+            return self._save_data_uri_to_local(image_url)
 
         # 已经是本地文件路径：复制到缓存目录持久化，避免被临时文件清理删掉
         if not image_url.startswith("http"):
@@ -1896,11 +1940,25 @@ class Main(star.Star):
         if not self._image_caption_enabled:
             return None
 
+        # data URI 处理（v3.3.1: 修复 issue #1 [Errno 36] File name too long）：
+        # 平台（如 NapCat QQ）有时直接传入 base64 data URI 而非 URL。
+        # AstrBot 内部在处理 image_urls 时可能对非 http 地址调用 open()，
+        # 导致超长 data URI 被当成文件名触发 ENAMETOOLONG。
+        # 解决方案：用哈希作为缓存键，并将 data URI 解码为本地文件后再送给 provider。
+        effective_url = image_url
+        cache_key = image_url
+        if image_url.startswith("data:"):
+            cache_key = "data:" + hashlib.md5(image_url.encode()).hexdigest()
+            local_path = self._save_data_uri_to_local(image_url)
+            if local_path:
+                effective_url = self._local_path_to_data_uri(local_path) or image_url
+            # 若无缓存目录则 effective_url 保持原始 data URI，由 provider 自行处理
+
         # 缓存命中检查：空字符串为上次失败的哨兵
-        if image_url in self._image_caption_cache:
+        if cache_key in self._image_caption_cache:
             self._image_caption_cache_hits += 1
-            self._image_caption_cache.move_to_end(image_url)
-            cached = self._image_caption_cache[image_url]
+            self._image_caption_cache.move_to_end(cache_key)
+            cached = self._image_caption_cache[cache_key]
             return cached if cached else None
 
         t0 = time.perf_counter()
@@ -1928,7 +1986,7 @@ class Main(star.Star):
                     response = await asyncio.wait_for(
                         provider.text_chat(
                             prompt=self._image_caption_prompt,
-                            image_urls=[image_url],
+                            image_urls=[effective_url],
                         ),
                         timeout=self._image_caption_timeout
                     )
@@ -1936,7 +1994,7 @@ class Main(star.Star):
                     elapsed = time.perf_counter() - t0
                     self._image_caption_errors += 1
                     logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s, 耗时 {elapsed:.1f}s)")
-                    self._mark_url_failed(image_url)  # 防重试
+                    self._mark_url_failed(cache_key)  # 防重试
                     return None
 
                 if response and response.completion_text:
@@ -1947,7 +2005,7 @@ class Main(star.Star):
                     if len(caption) > 100:
                         caption = caption[:97] + "..."
                     # 缓存结果（使用 OrderedDict 实现 LRU）
-                    self._image_caption_cache[image_url] = caption
+                    self._image_caption_cache[cache_key] = caption
                     # LRU 淘汰：超过硬上限时移除最旧的
                     while len(self._image_caption_cache) > self._image_caption_cache_max:
                         self._image_caption_cache.popitem(last=False)
@@ -1955,14 +2013,14 @@ class Main(star.Star):
                     return caption
 
                 # LLM返回空响应（如图片被核心静默丢弃等），标记失败
-                self._mark_url_failed(image_url)
+                self._mark_url_failed(cache_key)
                 return None
 
         except Exception as e:
             elapsed = time.perf_counter() - t0
             self._image_caption_errors += 1
             logger.error(f"[ContextAware] 图像转述失败 ({elapsed:.1f}s): {e}")
-            self._mark_url_failed(image_url)
+            self._mark_url_failed(cache_key)
 
         return None
 

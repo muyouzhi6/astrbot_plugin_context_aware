@@ -65,6 +65,11 @@ help: |
   - 轻量快速，图像转述为可选功能
   - v3.0.0: 并发安全、高性能、可观测
 
+  v3.3.1 更新：
+  - [FIX] 修复 issue #1：平台以 base64 data URI 传入图片时触发 [Errno 36] File name too long
+    data URI 现在会先解码落盘再送视觉模型，同时用哈希作为缓存键避免超大 key 占内存
+  - [FIX] lazy 模式 _download_image_to_local 同样支持 data URI 输入
+
   v3.3.0 更新：
   - [FEAT] 新增 lazy 图像转述模式（image_caption_lazy）：图片到达时仅记录占位，
     只在 LLM 真正需要用到该图片时才调用视觉模型，避免对无关图片浪费视觉 API 调用
@@ -80,7 +85,7 @@ help: |
   - [CONFIG] 新增 strict_mode：开启后主动/未知触发场景强制不推断 talking_to=bot，彻底减少误回复
 
   配置说明请查看插件配置页面。
-version: 3.3.0
+version: 3.3.1
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"
