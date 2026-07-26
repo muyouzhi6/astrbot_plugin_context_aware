@@ -35,6 +35,12 @@
     "type": "bool",
     "default": true
   },
+  "strict_mode": {
+    "description": "严格模式：主动触发场景下强制不推断「用户在和Bot说话」",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，在 active/unknown 触发时 Bot 不会被推断为对话对象，可显著降低误回复率。如果 Bot 经常在不该回复时开口，建议开启此选项。"
+  },
   "warn_builtin_ltm": {
     "description": "检测到内置群聊上下文感知时输出警告",
     "type": "bool",

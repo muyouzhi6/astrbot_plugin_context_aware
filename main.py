@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.1.6 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.2.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,14 @@ AstrBot 上下文场景感知增强插件 v3.1.6 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.2.0 更新:
+- [FIX] 收紧规则4时间窗口（35s→20s），降低高频群聊中短确认词误判为回复Bot的概率
+- [FIX] 规则4新增"他人正在对话中"保护：若最近有其他人主动在和当前用户说话，不推断为回复Bot
+- [REMOVE] 删除规则6（快速连续对话推断）：该规则增加推断复杂度，在群聊中易产生误导
+- [FIX] 强化 TRIGGER_ACTIVE + talking_to=bot 的 instruction，LLM 现在会更保守地判断是否需要回复
+- [FIX] Gemini_STT 的 cache_only / should_reply=False 消息在 on_message 入口即过滤，不再记录
+- [CONFIG] 新增 strict_mode：开启后主动触发场景下强制不推断 talking_to=bot，彻底减少误回复
 
 v3.1.6 更新:
 - [FIX] 语音转写独立上下文窗口，避免高频群聊把未回复语音挤出最近对话流
@@ -58,7 +66,7 @@ v2.5.1 更新:
 - 戳一戳时正确显示戳一戳用户信息
 
 Author: 木有知
-Version: 3.1.6
+Version: 3.2.0
 """
 
 from __future__ import annotations
@@ -158,7 +166,6 @@ class InferenceReason:
     RULE_4_BOT_REPLIED: Final[str] = "rule_4_bot_replied" # Bot 刚回复过此人
     RULE_4B_BOT_INTERRUPTED: Final[str] = "rule_4b_bot_interrupted" # Bot 插话导致误判，回退给上一位对话者
     RULE_5_ABA_PATTERN: Final[str] = "rule_5_aba_pattern" # A-B-A 对话模式
-    RULE_6_QUICK_FOLLOW: Final[str] = "rule_6_quick_follow"  # 快速连续对话
     DEFAULT_GROUP: Final[str] = "default_group"           # 默认群聊
 
 
@@ -737,7 +744,7 @@ class SceneAnalyzer:
         self._bot_id = bot_id
         names = [n.lower() for n in (bot_names or []) if n]
         self._bot_names: tuple[str, ...] = tuple(names)
-        # 为英文/数字类名字做边界匹配，降低误触发（如 “robot” 包含 “bot”）
+        # 为英文/数字类名字做边界匹配，降低误触发（如 "robot" 包含 "bot"）
         compiled: list[tuple[str, re.Pattern[str] | None]] = []
         for n in names:
             if re.fullmatch(r"[a-z0-9_]+", n):
@@ -905,7 +912,7 @@ class SceneAnalyzer:
                 )
             return TRIGGER_UNKNOWN, "存在触发信号，但不是在明确呼叫你"
 
-        # 如果没有任何显式唤醒条件但仍触发了 LLM 请求，通常属于“主动回复/主动搭话”类场景
+        # 如果没有任何显式唤醒条件但仍触发了 LLM 请求，通常属于"主动回复/主动搭话"类场景
         # （例如 AstrBot 的主动回复功能或其他插件主动调用 request_llm）
         if not event.is_at_or_wake_command and not event.is_private_chat():
             return TRIGGER_ACTIVE, "你是主动加入这个对话的，没有人在叫你"
@@ -986,13 +993,15 @@ class SceneAnalyzer:
 
         # ===== 规则4: Bot 刚回复过当前用户，且用户像在回应（中置信度）=====
         # 关键修复：必须是 Bot 之前在回复"当前这个用户"，才能推断用户在回复 Bot
-        if last.is_bot and time_gap < 35:
+        # v3.2.0: 时间窗口从35s收紧到20s，降低高频群聊中的误判率
+        if last.is_bot and time_gap < 20:
             # 检查 Bot 上次是否在回复当前发言者
             if bot_replied_to == msg.sender_id:
                 stripped = msg.content.strip()
-                # 保守：只对“短确认/致谢类”做推断，避免把用户对他人的“好的/嗯”等当成回复 Bot
+                # 保守：只对"短确认/致谢类"做推断，避免把用户对他人的"好的/嗯"等当成回复 Bot
                 if stripped and len(stripped) <= 20 and self._looks_like_reply(stripped):
-                    # 若 Bot 插话前，群里有人刚刚在和该用户说话，则优先认为用户在回那个人
+                    # v3.2.0: 若最近60s内有其他用户主动在和当前发言者说话，
+                    # 则认为用户在回应那个人，而非 Bot
                     history_list = list(history) if isinstance(history, deque) else history
                     prev_to_user: MessageRecord | None = None
                     for m in reversed(history_list[:-1]):
@@ -1003,7 +1012,8 @@ class SceneAnalyzer:
                         if m.talking_to == msg.sender_id:
                             prev_to_user = m
                             break
-                    if prev_to_user and (last.timestamp - prev_to_user.timestamp) < 60:
+                    if prev_to_user and (msg.timestamp - prev_to_user.timestamp) < 60:
+                        # 群里有人刚在和当前用户对话，"好的/谢谢"更可能是回那个人的
                         msg.talking_to, msg.talking_to_name = (
                             prev_to_user.sender_id,
                             prev_to_user.sender_name,
@@ -1024,14 +1034,9 @@ class SceneAnalyzer:
                 msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
                 return InferenceReason.RULE_5_ABA_PATTERN
 
-        # ===== 规则6: 快速连续对话（最低置信度，收紧条件）=====
-        # 只有非常短的时间间隔 + 非 Bot 消息 + 上一条是对群说的，才推断是延续对话
-        if time_gap < 15 and not last.is_bot:
-            # 如果上一条是某人对群说的，当前消息可能是在回应那个人
-            if last.talking_to == "group":
-                msg.talking_to, msg.talking_to_name = last.sender_id, last.sender_name
-                return InferenceReason.RULE_6_QUICK_FOLLOW
-        
+        # 规则6 (快速连续对话推断) 已在 v3.2.0 移除：
+        # 该规则在群聊中增加推断复杂度且容易产生误导，改为统一默认为群聊。
+
         # 默认：保持 talking_to = "group"，表示无法确定具体对话对象
         return InferenceReason.DEFAULT_GROUP
 
@@ -1241,16 +1246,20 @@ class SceneGenerator:
         # ===== 主动触发 - 需要特别小心 =====
         if trigger == TRIGGER_ACTIVE:
             if is_talking_to_bot:
-                # 即使推断用户在和 Bot 说话，也要提醒这是主动触发
+                # v3.2.0: 即使上下文推断用户在回复 Bot，也必须明确告知这是主动触发场景。
+                # 把"可能在回应你"的语气收紧，防止 LLM 把不确定的推断当作明确意图。
                 return (
-                    "你是主动加入对话的。根据上下文分析，用户可能在回应你之前的消息。"
-                    "请谨慎判断，如果不确定，宁可保持观望。"
+                    "【注意】你是主动加入对话的，没有人明确叫你。"
+                    "虽然上下文显示用户的短消息可能在回应你之前说的话，"
+                    "但这只是低置信度的推断，不代表用户真的在和你说话。"
+                    "【行为要求】除非用户消息内容明确需要你回应，否则请保持沉默或只做极简短的确认，"
+                    "不要主动展开话题或给出长篇回复。"
                 )
 
             if is_talking_to_group:
                 return (
-                    "【注意】你是主动加入对话的，这条消息是说给群里的，不是在问你。"
-                    "不要把这当作向你提问。"
+                    "【重要】你是主动加入对话的，这条消息是说给群里的，不是在问你。"
+                    "请勿把这当作向你提问。"
                     "合适的做法：1)发表自己的看法 2)补充相关信息 3)保持沉默。"
                 )
 
@@ -1321,6 +1330,8 @@ class Main(star.Star):
         self._image_context_window = max(1, self._cfg_int("image_context_window", 20))
         self._voice_context_window = max(0, self._cfg_int("voice_context_window", 50))
         self._builtin_ltm_warned: set[str] = set()
+        # v3.2.0: 严格模式，主动触发场景下强制不推断 talking_to=bot
+        self._strict_mode = self._cfg_bool("strict_mode", False)
 
         # 图像转述配置
         self._image_caption_enabled = self._cfg_bool("image_caption", False)
@@ -1360,7 +1371,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.1.6"
+        version = "3.2.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
 
@@ -1570,7 +1581,7 @@ class Main(star.Star):
                 instruction = cfg["instruction"].strip()
                 if not instruction:
                     instruction = (
-                        "你是“群聊上下文压缩器”。请将下面这段群聊/机器人对话历史压缩成一段简洁中文摘要，要求：\n"
+                        '你是"群聊上下文压缩器"。请将下面这段群聊/机器人对话历史压缩成一段简洁中文摘要，要求：\n'
                         "1) 保留关键事实、结论、已达成的决定、正在讨论的话题、未解决的问题。\n"
                         "2) 尽量保留人物关系与称呼（谁在对谁说什么），但不要逐条复述。\n"
                         "3) 输出长度控制在 200-600 字，避免空话套话。\n"
@@ -1920,6 +1931,16 @@ class Main(star.Star):
                         pass
 
             trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)
+
+            # v3.2.0: strict_mode 开启时，主动触发场景下强制 talking_to = "group"，
+            # 彻底避免 TRIGGER_ACTIVE 场景下 LLM 误以为用户在和自己说话。
+            if self._strict_mode and trigger_type in (TRIGGER_ACTIVE, TRIGGER_UNKNOWN):
+                if current.talking_to == "bot":
+                    current.talking_to = "group"
+                    current.talking_to_name = "群聊"
+                    logger.debug(
+                        f"[ContextAware] strict_mode: {current.sender_name} 的 talking_to 强制重置为 group"
+                    )
 
             window = self._cfg_int("dialogue_window", 8)
             flow = flow_source[-window:] if window > 0 else flow_source

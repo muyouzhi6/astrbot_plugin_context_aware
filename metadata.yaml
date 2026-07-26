@@ -65,8 +65,16 @@ help: |
   - 轻量快速，图像转述为可选功能
   - v3.0.0: 并发安全、高性能、可观测
 
+  v3.2.0 更新：
+  - [FIX] 收紧规则4时间窗口（35s→20s），降低高频群聊中短确认词被误判为回复Bot的概率
+  - [FIX] 规则4新增"他人正在对话中"保护：最近60秒内有其他人主动和当前用户说话时，不推断为回复Bot
+  - [REMOVE] 删除规则6（快速连续对话推断）：该规则在群聊中增加推断复杂度，已移除
+  - [FIX] 强化主动触发+Bot推断场景的 instruction，LLM 现在会更保守地判断是否需要回复
+  - [FIX] Gemini_STT 的 cache_only 和 should_reply=False 消息在 on_message 入口即过滤
+  - [CONFIG] 新增 strict_mode：开启后主动/未知触发场景强制不推断 talking_to=bot，彻底减少误回复
+
   配置说明请查看插件配置页面。
-version: 3.1.6
+version: 3.2.0
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"
