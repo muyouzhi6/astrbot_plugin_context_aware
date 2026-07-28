@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.3.3 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.4.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -16,7 +16,9 @@ AstrBot 上下文场景感知增强插件 v3.3.3 (Context-Aware Enhancement)
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
 
-v3.3.3 更新:
+v3.4.0 更新:
+- [FEAT] 新增可选的 LLM 请求图片压缩，不修改原图，支持自定义阈值、分辨率、质量和输出大小
+- [FIX] QQ CDN 图片下载增加完整性校验、重试和失败缓存，降低引用大图时的下载中断概率
 - [FIX] `/reset` 和 `/new` 在记录消息前清空插件上下文，覆盖第三方 Agent runner
 - [FIX] 兼容 `astrbot_plugin_cmdmask` 的伪装指令，按真实 target 清理上下文
 
@@ -42,7 +44,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.3.3
+Version: 3.4.0
 """
 
 from __future__ import annotations
@@ -50,11 +52,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import http.client
 import mimetypes
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import OrderedDict, deque
@@ -69,10 +73,27 @@ from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
 
 try:
-    from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+    from astrbot.core.utils.astrbot_path import (
+        get_astrbot_plugin_data_path,
+        get_astrbot_temp_path,
+    )
 except Exception:
     def get_astrbot_plugin_data_path() -> str:
         return os.path.join(os.getcwd(), "plugin_data")
+
+    def get_astrbot_temp_path() -> str:
+        return os.path.join(get_astrbot_plugin_data_path(), "temp")
+
+try:
+    from .image_compression import (
+        ImageCompressionOptions,
+        compress_local_image,
+    )
+except ImportError:
+    from image_compression import (  # type: ignore[no-redef]
+        ImageCompressionOptions,
+        compress_local_image,
+    )
 
 if TYPE_CHECKING:
     from astrbot.core.config import AstrBotConfig
@@ -108,6 +129,8 @@ class ExtraKeys:
     # a configured alias (for example, "/wipe" -> "/reset").
     CMDMASK_APPLIED: Final[str] = "__astrbot_plugin_cmdmask:applied"
     CMDMASK_TARGET: Final[str] = "__astrbot_plugin_cmdmask:target"
+
+    IMAGE_COMPRESS_MAP: Final[str] = "_context_aware_image_compress_map"
     
     # 场景注入标记，防止重复注入
     SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
@@ -1347,6 +1370,10 @@ class Main(star.Star):
         self._image_caption_prompt = str(
             self._cfg("image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。") or ""
         )
+        self._image_compress_options = ImageCompressionOptions.from_mapping(
+            self._cfg("llm_image_compress", {})
+        )
+        self._image_compress_output_dir = get_astrbot_temp_path()
 
         # v3.0.0: 图像转述并发控制
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
@@ -1366,7 +1393,10 @@ class Main(star.Star):
         except Exception as e:
             logger.warning(f"[ContextAware] 无法创建图片缓存目录 {self._image_cache_dir}: {e}")
             self._image_cache_dir = ""
-        self._image_download_cache: dict[str, str | None] = {}  # URL -> local_path_or_None
+        self._image_download_cache: dict[tuple[str, int], str] = {}
+        self._image_download_failures: dict[tuple[str, int], float] = {}
+        self._image_download_failure_ttl = 30.0
+        self._image_download_locks: dict[tuple[str, int], asyncio.Lock] = {}
         # 缓存下载大小上限（50MB）
         self._image_download_max_bytes = max(
             1, self._cfg_int("image_download_max_bytes", 50 * 1024 * 1024)
@@ -1405,12 +1435,21 @@ class Main(star.Star):
         self._image_caption_count = 0
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
+        self._image_compress_count = 0
+        self._image_compress_errors = 0
+        self._image_compress_saved_bytes = 0
 
-        version = "3.3.3"
+        version = "3.4.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
-        logger.info(f"[ContextAware] 插件 v{version} 已加载 | 图像转述: {caption_status}")
+        compress_status = (
+            "已启用" if self._image_compress_options.enabled else "未启用"
+        )
+        logger.info(
+            f"[ContextAware] 插件 v{version} 已加载 | "
+            f"图像转述: {caption_status} | LLM 图片压缩: {compress_status}"
+        )
 
     def _cfg(self, key: str, default: Any = None) -> Any:
         """获取配置项"""
@@ -1719,7 +1758,20 @@ class Main(star.Star):
         while len(self._image_caption_cache) > self._image_caption_cache_max:
             self._image_caption_cache.popitem(last=False)
 
-    def _save_data_uri_to_local(self, data_uri: str) -> str | None:
+    @staticmethod
+    def _hash_large_text(value: str) -> str:
+        digest = hashlib.md5()  # nosec B324 - cache key, not security-sensitive
+        chunk_size = 1024 * 1024
+        for offset in range(0, len(value), chunk_size):
+            digest.update(value[offset : offset + chunk_size].encode("ascii"))
+        return digest.hexdigest()
+
+    def _save_data_uri_to_local(
+        self,
+        data_uri: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> str | None:
         """将 base64 data URI 解码保存到本地缓存文件，返回本地路径。
 
         用于处理平台（如 NapCat QQ）直接以 data URI 格式传入图片的场景，
@@ -1738,18 +1790,56 @@ class Main(star.Star):
             if ext == ".jpe":  # Python 有时返回 .jpe 而非 .jpg
                 ext = ".jpg"
 
-            # 用编码内容的前512字节做哈希，避免对超大 base64 全量计算
-            url_hash = hashlib.md5(encoded[:512].encode()).hexdigest()
+            limit = max_bytes or self._image_download_max_bytes
+            estimated_size = (len(encoded) * 3) // 4
+            if estimated_size > limit:
+                logger.warning(
+                    f"[ContextAware] data URI 图片超过处理上限 ({limit} bytes)"
+                )
+                return None
+
+            url_hash = self._hash_large_text(data_uri)
             local_path = os.path.join(
                 self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
             )
             if not os.path.exists(local_path):
                 raw = base64.b64decode(encoded)
+                if len(raw) > limit:
+                    return None
                 with open(local_path, "wb") as f:
                     f.write(raw)
             return local_path
         except Exception as e:
             logger.warning(f"[ContextAware] base64 data URI 保存失败: {e}")
+            return None
+
+    def _save_base64_image_to_local(
+        self,
+        image_ref: str,
+        *,
+        max_bytes: int,
+    ) -> str | None:
+        if not self._image_cache_dir or not image_ref.startswith("base64://"):
+            return None
+        try:
+            encoded = image_ref.removeprefix("base64://")
+            estimated_size = (len(encoded) * 3) // 4
+            if estimated_size > max_bytes:
+                return None
+            raw = base64.b64decode(encoded)
+            if len(raw) > max_bytes:
+                return None
+            url_hash = self._hash_large_text(image_ref)
+            local_path = os.path.join(
+                self._image_cache_dir,
+                f"{IMAGE_CACHE_PREFIX}{url_hash}.jpg",
+            )
+            if not os.path.exists(local_path):
+                with open(local_path, "wb") as f:
+                    f.write(raw)
+            return local_path
+        except Exception as e:
+            logger.warning(f"[ContextAware] base64 图片保存失败: {e}")
             return None
 
     def _cleanup_image_cache(self, force: bool = False) -> None:
@@ -1790,13 +1880,35 @@ class Main(star.Star):
         except Exception as e:
             logger.warning(f"[ContextAware] 缓存清理异常: {e}")
 
+        download_cache = getattr(self, "_image_download_cache", {})
+        for cache_key, cached_path in list(download_cache.items()):
+            if not os.path.exists(cached_path):
+                download_cache.pop(cache_key, None)
+
+        failures = getattr(self, "_image_download_failures", {})
+        failure_ttl = getattr(self, "_image_download_failure_ttl", 30.0)
+        for cache_key, failed_at in list(failures.items()):
+            if now - failed_at >= failure_ttl:
+                failures.pop(cache_key, None)
+
+        download_locks = getattr(self, "_image_download_locks", {})
+        for cache_key, lock in list(download_locks.items()):
+            if (
+                cache_key not in download_cache
+                and cache_key not in failures
+                and not lock.locked()
+            ):
+                download_locks.pop(cache_key, None)
+
     def _start_image_cache_cleanup_task(self) -> None:
         """启动图片缓存后台清理任务；无事件循环时可稍后重试。"""
         if (
             self._image_cache_cleanup_task
             or not self._image_cache_dir
-            or not self._image_caption_enabled
-            or not self._image_caption_lazy
+            or not (
+                (self._image_caption_enabled and self._image_caption_lazy)
+                or self._image_compress_options.enabled
+            )
         ):
             return
         try:
@@ -1813,7 +1925,14 @@ class Main(star.Star):
             await asyncio.sleep(IMAGE_CACHE_CLEANUP_INTERVAL)
             self._cleanup_image_cache(force=True)
 
-    async def _download_image_to_local(self, image_url: str) -> str | None:
+    async def _download_image_to_local(
+        self,
+        image_url: str,
+        *,
+        max_bytes: int | None = None,
+        retries: int = 1,
+        timeout: int | None = None,
+    ) -> str | None:
         """下载图片到本地缓存目录，返回本地文件路径。
 
         如果 image_url 已经是本地路径（AstrBot 框架已缓存），直接使用。
@@ -1827,16 +1946,32 @@ class Main(star.Star):
         self._cleanup_image_cache()
 
         # base64 data URI：解码保存到本地（v3.3.1: 修复 [Errno 36] issue #1）
+        effective_limit = max(1, max_bytes or self._image_download_max_bytes)
+
         if image_url.startswith("data:"):
-            return self._save_data_uri_to_local(image_url)
+            return self._save_data_uri_to_local(
+                image_url,
+                max_bytes=effective_limit,
+            )
+
+        if image_url.startswith("base64://"):
+            return self._save_base64_image_to_local(
+                image_url,
+                max_bytes=effective_limit,
+            )
 
         # 已经是本地文件路径：复制到缓存目录持久化，避免被临时文件清理删掉
         if not image_url.startswith("http"):
-            if os.path.exists(image_url):
+            local_ref = image_url
+            if image_url.startswith("file://"):
+                local_ref = urllib.parse.unquote(image_url.removeprefix("file://"))
+            if os.path.exists(local_ref):
+                if os.path.getsize(local_ref) > effective_limit:
+                    return None
                 if not self._image_cache_dir:
-                    return image_url
-                url_hash = hashlib.md5(image_url.encode()).hexdigest()
-                _, ext = os.path.splitext(image_url)
+                    return local_ref
+                url_hash = hashlib.md5(local_ref.encode()).hexdigest()
+                _, ext = os.path.splitext(local_ref)
                 if not ext:
                     ext = ".jpg"
                 cached_path = os.path.join(
@@ -1845,27 +1980,31 @@ class Main(star.Star):
                 if not os.path.exists(cached_path):
                     import shutil
                     try:
-                        shutil.copy2(image_url, cached_path)
+                        shutil.copy2(local_ref, cached_path)
                     except Exception:
-                        return image_url  # fallback 到原路径
+                        return local_ref  # fallback 到原路径
                 return cached_path
             return None
 
         if not self._image_cache_dir:
             return None
 
-        # 检查是否已下载过
-        if image_url in self._image_download_cache:
-            cached = self._image_download_cache[image_url]
-            if cached and os.path.exists(cached):
+        cache_key = (image_url, effective_limit)
+        if cache_key in self._image_download_cache:
+            cached = self._image_download_cache[cache_key]
+            if os.path.exists(cached):
                 return cached
-            if cached:
-                self._image_download_cache.pop(image_url, None)
-            else:
+            self._image_download_cache.pop(cache_key, None)
+        failed_at = self._image_download_failures.get(cache_key)
+        if failed_at is not None:
+            if time.time() - failed_at < self._image_download_failure_ttl:
                 return None
+            self._image_download_failures.pop(cache_key, None)
 
         # 生成缓存文件名
-        url_hash = hashlib.md5(image_url.encode()).hexdigest()
+        url_hash = hashlib.md5(
+            f"{effective_limit}\0{image_url}".encode()
+        ).hexdigest()
         ext = ".jpg"
         lower_url = image_url.lower()
         if ".png" in lower_url:
@@ -1880,30 +2019,71 @@ class Main(star.Star):
         )
 
         if os.path.exists(local_path):
-            self._image_download_cache[image_url] = local_path
-            return local_path
-
-        try:
-            content_size = await asyncio.to_thread(
-                self._download_remote_image_sync,
-                image_url,
-                local_path,
-            )
-            if content_size is None:
-                self._image_download_cache[image_url] = None
+            if 0 < os.path.getsize(local_path) <= effective_limit:
+                self._image_download_cache[cache_key] = local_path
+                return local_path
+            try:
+                os.remove(local_path)
+            except OSError:
                 return None
-            self._image_download_cache[image_url] = local_path
-            logger.info(
-                f"[ContextAware] 图片已缓存到本地 ({content_size} bytes): "
-                f"{os.path.basename(local_path)}"
-            )
-            return local_path
-        except Exception as e:
-            logger.warning(f"[ContextAware] 图片下载异常: {e}")
-            self._image_download_cache[image_url] = None
+
+        download_lock = self._image_download_locks.setdefault(
+            cache_key,
+            asyncio.Lock(),
+        )
+        async with download_lock:
+            if os.path.exists(local_path):
+                if 0 < os.path.getsize(local_path) <= effective_limit:
+                    self._image_download_cache[cache_key] = local_path
+                    return local_path
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    return None
+
+            attempts = max(1, min(int(retries), 5))
+            effective_timeout = max(5, min(int(timeout or 15), 120))
+            for attempt in range(1, attempts + 1):
+                try:
+                    content_size = await asyncio.to_thread(
+                        self._download_remote_image_sync,
+                        image_url,
+                        local_path,
+                        max_bytes=effective_limit,
+                        timeout=effective_timeout,
+                    )
+                except Exception as e:
+                    logger.warning(f"[ContextAware] 图片下载异常: {e}")
+                    content_size = None
+
+                if content_size is not None:
+                    self._image_download_cache[cache_key] = local_path
+                    self._image_download_failures.pop(cache_key, None)
+                    logger.info(
+                        f"[ContextAware] 图片已缓存到本地 ({content_size} bytes): "
+                        f"{os.path.basename(local_path)}"
+                    )
+                    return local_path
+
+                if attempt < attempts:
+                    delay = min(0.5 * (2 ** (attempt - 1)), 2.0)
+                    logger.warning(
+                        f"[ContextAware] 图片下载失败, {delay:.1f}s 后重试 "
+                        f"({attempt}/{attempts}): {image_url[:60]}..."
+                    )
+                    await asyncio.sleep(delay)
+
+            self._image_download_failures[cache_key] = time.time()
             return None
 
-    def _download_remote_image_sync(self, image_url: str, local_path: str) -> int | None:
+    def _download_remote_image_sync(
+        self,
+        image_url: str,
+        local_path: str,
+        *,
+        max_bytes: int | None = None,
+        timeout: int = 15,
+    ) -> int | None:
         """同步下载远程图片；由 asyncio.to_thread 调用，避免阻塞事件循环。"""
         def cleanup_partial() -> None:
             try:
@@ -1919,9 +2099,10 @@ class Main(star.Star):
                 "Chrome/134.0.0.0 Safari/537.36"
             ),
         }
+        effective_limit = max(1, max_bytes or self._image_download_max_bytes)
         req = urllib.request.Request(image_url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 status = getattr(resp, "status", 200)
                 if status != 200:
                     logger.warning(
@@ -1929,13 +2110,14 @@ class Main(star.Star):
                     )
                     return None
 
+                cl: int | None = None
                 content_length = resp.headers.get("Content-Length")
                 if content_length:
                     try:
                         cl = int(content_length)
                     except ValueError:
                         cl = None
-                    if cl is not None and cl > self._image_download_max_bytes:
+                    if cl is not None and cl > effective_limit:
                         logger.warning(
                             f"[ContextAware] 图片过大 ({cl} bytes)，跳过缓存: {image_url[:60]}..."
                         )
@@ -1948,10 +2130,10 @@ class Main(star.Star):
                         if not chunk:
                             break
                         total += len(chunk)
-                        if total > self._image_download_max_bytes:
+                        if total > effective_limit:
                             logger.warning(
                                 f"[ContextAware] 图片下载超过上限 "
-                                f"({self._image_download_max_bytes} bytes)，已中止: "
+                                f"({effective_limit} bytes)，已中止: "
                                 f"{image_url[:60]}..."
                             )
                             cleanup_partial()
@@ -1960,6 +2142,13 @@ class Main(star.Star):
                 if total <= 0:
                     cleanup_partial()
                     return None
+                if cl is not None and total != cl:
+                    cleanup_partial()
+                    logger.warning(
+                        f"[ContextAware] 图片下载不完整 ({total}/{cl} bytes): "
+                        f"{image_url[:60]}..."
+                    )
+                    return None
                 return total
         except urllib.error.HTTPError as e:
             cleanup_partial()
@@ -1967,10 +2156,214 @@ class Main(star.Star):
                 f"[ContextAware] 图片下载失败 HTTP {e.code}: {image_url[:60]}..."
             )
             return None
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (
+            http.client.IncompleteRead,
+            urllib.error.ContentTooShortError,
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+        ) as e:
             cleanup_partial()
             logger.warning(f"[ContextAware] 图片下载异常: {e}")
             return None
+
+    @staticmethod
+    def _component_image_ref(component: Any) -> str:
+        for attr in ("url", "file", "path"):
+            value = getattr(component, attr, "")
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    @staticmethod
+    def _replace_component_image_ref(component: Any, image_ref: str) -> None:
+        for attr in ("url", "file", "path"):
+            if hasattr(component, attr):
+                try:
+                    setattr(component, attr, image_ref)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _track_temporary_image(event: AstrMessageEvent, image_path: str) -> None:
+        tracker = getattr(event, "track_temporary_local_file", None)
+        if callable(tracker):
+            tracker(image_path)
+
+    def _event_image_compress_map(
+        self,
+        event: AstrMessageEvent,
+    ) -> dict[str, str]:
+        try:
+            existing = event.get_extra(ExtraKeys.IMAGE_COMPRESS_MAP, None)
+            if isinstance(existing, dict):
+                return existing
+        except Exception:
+            pass
+
+        mapping: dict[str, str] = {}
+        try:
+            event.set_extra(ExtraKeys.IMAGE_COMPRESS_MAP, mapping)
+        except Exception:
+            pass
+        return mapping
+
+    async def _materialize_image_for_compression(self, image_ref: str) -> str | None:
+        options = self._image_compress_options
+        if image_ref.startswith("file://"):
+            local_path = urllib.parse.unquote(image_ref.removeprefix("file://"))
+            return local_path if os.path.isfile(local_path) else None
+        if not image_ref.startswith(("http://", "https://", "data:", "base64://")):
+            return image_ref if os.path.isfile(image_ref) else None
+        return await self._download_image_to_local(
+            image_ref,
+            max_bytes=options.max_input_bytes,
+            retries=options.download_retries,
+            timeout=options.download_timeout,
+        )
+
+    async def _compress_image_reference(
+        self,
+        event: AstrMessageEvent,
+        image_ref: str,
+    ) -> str:
+        options = self._image_compress_options
+        if not options.enabled or not image_ref:
+            return image_ref
+
+        mapping = self._event_image_compress_map(event)
+        cached = mapping.get(image_ref)
+        if cached:
+            return cached
+
+        local_path = await self._materialize_image_for_compression(image_ref)
+        if not local_path:
+            mapping[image_ref] = image_ref
+            self._image_compress_errors += 1
+            logger.warning(
+                f"[ContextAware] LLM 图片压缩跳过, 无法读取图片: {image_ref[:80]}"
+            )
+            return image_ref
+
+        outcome = await asyncio.to_thread(
+            compress_local_image,
+            local_path,
+            self._image_compress_output_dir,
+            options,
+        )
+        if not outcome.changed:
+            effective_ref = local_path if os.path.isfile(local_path) else image_ref
+            mapping[image_ref] = effective_ref
+            mapping[local_path] = effective_ref
+            if outcome.reason.startswith("error:"):
+                self._image_compress_errors += 1
+                logger.warning(
+                    f"[ContextAware] LLM 图片压缩失败 ({outcome.reason}): "
+                    f"{image_ref[:80]}"
+                )
+            elif outcome.reason == "source_too_large":
+                logger.warning(
+                    f"[ContextAware] LLM 图片超过输入上限, 保留原引用: "
+                    f"{outcome.source_bytes} bytes"
+                )
+            return effective_ref
+
+        self._track_temporary_image(event, outcome.output_path)
+        mapping[image_ref] = outcome.output_path
+        mapping[local_path] = outcome.output_path
+        mapping[outcome.output_path] = outcome.output_path
+        self._image_compress_count += 1
+        self._image_compress_saved_bytes += max(
+            outcome.source_bytes - outcome.output_bytes,
+            0,
+        )
+        source_size = "x".join(map(str, outcome.source_size or (0, 0)))
+        output_size = "x".join(map(str, outcome.output_size or (0, 0)))
+        logger.info(
+            f"[ContextAware] LLM 图片压缩完成: "
+            f"{outcome.source_bytes / 1024:.0f}KB {source_size} -> "
+            f"{outcome.output_bytes / 1024:.0f}KB {output_size}"
+        )
+        return outcome.output_path
+
+    async def _prepare_event_images_for_llm(
+        self,
+        event: AstrMessageEvent,
+    ) -> None:
+        if not self._image_compress_options.enabled:
+            return
+        if not bool(getattr(event, "is_at_or_wake_command", False)):
+            return
+
+        try:
+            messages = event.get_messages()
+        except Exception:
+            return
+
+        for component in messages:
+            if isinstance(component, Image):
+                source_ref = self._component_image_ref(component)
+                compressed_ref = await self._compress_image_reference(
+                    event,
+                    source_ref,
+                )
+                if compressed_ref != source_ref:
+                    self._replace_component_image_ref(component, compressed_ref)
+            elif isinstance(component, Reply):
+                for reply_component in getattr(component, "chain", None) or []:
+                    if not isinstance(reply_component, Image):
+                        continue
+                    source_ref = self._component_image_ref(reply_component)
+                    compressed_ref = await self._compress_image_reference(
+                        event,
+                        source_ref,
+                    )
+                    if compressed_ref != source_ref:
+                        self._replace_component_image_ref(
+                            reply_component,
+                            compressed_ref,
+                        )
+
+    async def _compress_provider_request_images(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        image_urls = getattr(req, "image_urls", None)
+        if not self._image_compress_options.enabled or not isinstance(
+            image_urls,
+            list,
+        ):
+            return
+
+        replacements: dict[str, str] = {}
+        compressed_urls: list[str] = []
+        for image_ref in image_urls:
+            if not isinstance(image_ref, str) or not image_ref:
+                compressed_urls.append(image_ref)
+                continue
+            compressed_ref = await self._compress_image_reference(
+                event,
+                image_ref,
+            )
+            compressed_urls.append(compressed_ref)
+            if compressed_ref != image_ref:
+                replacements[image_ref] = compressed_ref
+        req.image_urls = compressed_urls
+
+        if not replacements:
+            return
+        for part in getattr(req, "extra_user_content_parts", None) or []:
+            text = getattr(part, "text", None)
+            if not isinstance(text, str):
+                continue
+            for source_ref, compressed_ref in replacements.items():
+                if source_ref in text:
+                    text = text.replace(source_ref, compressed_ref)
+            try:
+                part.text = text
+            except Exception:
+                pass
 
     @staticmethod
     def _local_path_to_data_uri(local_path: str) -> str | None:
@@ -2256,6 +2649,12 @@ class Main(star.Star):
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
     async def on_message(self, event: AstrMessageEvent, *args: Any, **kwargs: Any) -> None:
         """监听所有消息，记录到历史"""
+        try:
+            await self._prepare_event_images_for_llm(event)
+        except Exception as e:
+            self._image_compress_errors += 1
+            logger.warning(f"[ContextAware] 消息图片预处理失败, 已保留原图: {e}")
+
         if not self._should_process(event):
             return
 
@@ -2329,6 +2728,12 @@ class Main(star.Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         """在 LLM 请求前注入场景描述"""
+        try:
+            await self._compress_provider_request_images(event, req)
+        except Exception as e:
+            self._image_compress_errors += 1
+            logger.warning(f"[ContextAware] LLM 请求图片预处理失败, 已保留原图: {e}")
+
         if not self._should_process(event):
             return
 
@@ -2362,7 +2767,7 @@ class Main(star.Star):
                     msg_id=f"poke_{uuid.uuid4().hex[:12]}",
                     sender_id=str(poke_sender_id),
                     sender_name=str(poke_sender_name),
-                    content=f"[戳了戳你]",
+                    content="[戳了戳你]",
                     timestamp=time.time(),
                     is_bot=False,
                     talking_to="bot",
@@ -2708,10 +3113,19 @@ class Main(star.Star):
             caption_info = f", 图像转述 {self._image_caption_count} 次"
             if self._image_caption_errors > 0:
                 caption_info += f" (失败 {self._image_caption_errors})"
+        compress_info = ""
+        if self._image_compress_options.enabled:
+            compress_info = (
+                f", LLM 图片压缩 {self._image_compress_count} 次"
+                f" (节省 {self._image_compress_saved_bytes / 1024 / 1024:.1f}MB)"
+            )
+            if self._image_compress_errors > 0:
+                compress_info += f" (失败 {self._image_compress_errors})"
         logger.info(
             f"[ContextAware] 插件已终止 | "
             f"统计: 消息 {self._stats.messages_recorded}, "
             f"场景注入 {self._stats.scenes_injected}, "
-            f"Bot回复 {self._stats.bot_responses_recorded}{caption_info} | "
+            f"Bot回复 {self._stats.bot_responses_recorded}"
+            f"{caption_info}{compress_info} | "
             f"触发类型: {trigger_summary or '无'}"
         )

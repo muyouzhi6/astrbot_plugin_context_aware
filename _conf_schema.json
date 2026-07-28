@@ -90,6 +90,83 @@
     "default": [],
     "hint": "留空使用默认词库。例如: 好的, 谢谢, 明白了"
   },
+  "llm_image_compress": {
+    "description": "LLM 请求图片压缩",
+    "type": "object",
+    "hint": "仅生成本次 LLM 请求使用的临时副本, 不修改原图。适用于普通图片、引用图片、data URI 和远程图片 URL。",
+    "items": {
+      "enable": {
+        "description": "启用 LLM 请求图片压缩",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭。开启后仅在图片超过体积阈值或最长边阈值时处理。"
+      },
+      "min_size_mb": {
+        "description": "触发压缩的文件大小（MB）",
+        "type": "float",
+        "default": 4.0,
+        "min": 0.1,
+        "max": 100.0,
+        "hint": "文件达到此大小, 或最长边超过下方阈值时触发压缩。"
+      },
+      "max_edge": {
+        "description": "压缩后最长边（像素）",
+        "type": "int",
+        "default": 2048,
+        "min": 512,
+        "max": 8192,
+        "hint": "推荐 2048。文字截图或细节识别需求可提高到 2560。"
+      },
+      "quality": {
+        "description": "JPEG 首选质量",
+        "type": "int",
+        "default": 90,
+        "min": 50,
+        "max": 100,
+        "hint": "推荐 90。透明图片保持 PNG, 此参数对 PNG 不生效。"
+      },
+      "min_quality": {
+        "description": "JPEG 自适应最低质量",
+        "type": "int",
+        "default": 75,
+        "min": 40,
+        "max": 100,
+        "hint": "输出仍过大时逐步降低质量, 不会低于此值。"
+      },
+      "max_output_size_mb": {
+        "description": "单图目标输出大小（MB）",
+        "type": "float",
+        "default": 2.0,
+        "min": 0.1,
+        "max": 50.0,
+        "hint": "超过目标时会先降低 JPEG 质量, 再逐步缩小分辨率。"
+      },
+      "max_input_size_mb": {
+        "description": "允许处理的单图大小上限（MB）",
+        "type": "float",
+        "default": 50.0,
+        "min": 1.0,
+        "max": 200.0,
+        "hint": "保护服务器内存。超过上限时保留原引用并记录警告。"
+      },
+      "download_retries": {
+        "description": "远程图片下载尝试次数",
+        "type": "int",
+        "default": 3,
+        "min": 1,
+        "max": 5,
+        "hint": "用于 QQ CDN 等连接提前中断场景, 推荐 3 次。"
+      },
+      "download_timeout": {
+        "description": "单次远程图片下载超时（秒）",
+        "type": "int",
+        "default": 15,
+        "min": 5,
+        "max": 120,
+        "hint": "超时后按下载尝试次数重试, 不会阻塞事件循环。"
+      }
+    }
+  },
   "image_caption": {
     "description": "启用图像转述（将群友发的图片转为文字描述）",
     "type": "bool",

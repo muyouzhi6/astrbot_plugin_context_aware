@@ -220,7 +220,7 @@ class Issue1DataUriTest(unittest.IsolatedAsyncioTestCase):
 
             plugin._get_image_caption = fake_caption
             # 直接测试缓存键逻辑：调用完后再次调用应命中缓存
-            result = await plugin._get_image_caption(_TINY_JPEG_DATA_URI)
+            await plugin._get_image_caption(_TINY_JPEG_DATA_URI)
             # 由于 _get_image_caption 本身被 mock 了，测试底层 save 和 key 逻辑
             # 改为直接测试 _save_data_uri_to_local 生成的 hash key
             expected_hash = hashlib.md5(_TINY_JPEG_DATA_URI.encode()).hexdigest()

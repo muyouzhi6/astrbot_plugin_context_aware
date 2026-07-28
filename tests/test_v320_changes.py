@@ -247,7 +247,6 @@ class V320ChangesTest(unittest.TestCase):
 
     def _make_fake_event(self, extras: dict | None = None, is_private: bool = False):
         """创建一个最小化 FakeEvent"""
-        mod = self.mod
         extras = extras or {}
 
         class FakeMsgObj:
@@ -313,14 +312,14 @@ class V320ChangesTest(unittest.TestCase):
             "RULE_6_QUICK_FOLLOW 已从 v3.2.0 中移除"
         )
 
-    def test_version_is_320(self):
-        """插件版本应为 3.3.x"""
+    def test_version_is_340(self):
+        """插件版本应为 3.4.x"""
         import re
         with open(PLUGIN_PATH, encoding="utf-8") as f:
             content = f.read()
         match = re.search(r'^Version:\s*(\S+)', content, re.MULTILINE)
         self.assertIsNotNone(match, "找不到 Version 字段")
-        self.assertTrue(match.group(1).startswith("3.3."), f"期望 3.3.x，实际: {match.group(1)}")
+        self.assertTrue(match.group(1).startswith("3.4."), f"期望 3.4.x，实际: {match.group(1)}")
 
 
 if __name__ == "__main__":

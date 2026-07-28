@@ -1,7 +1,10 @@
 # 上下文场景感知增强
 
-## v3.3.3
+## v3.4.0
 
+- 新增可选的 LLM 请求图片压缩, 仅生成临时副本, 不修改原图。
+- 支持按文件大小或最长边触发, 并可调 JPEG 质量、最低质量、目标输出大小和输入上限。
+- QQ CDN 图片下载增加完整性校验、指数退避重试和短时失败缓存, 减少引用大图时的下载中断。
 - 修复 `/new` 和 `/reset` 后插件上下文未清理的问题, 覆盖第三方 Agent runner。
 - 兼容 AstrBot 当前的 `_clean_group_context_session` 信号, 并保留旧版 `_clean_ltm_session` 兼容。
 - 兼容 `astrbot_plugin_cmdmask` 的伪装指令, 根据插件提供的真实 target 清理上下文。
@@ -65,6 +68,7 @@ provider_settings:
 | **触发类型识别** | ✅ | ❌ |
 | **行为指导** | ✅ | ❌ |
 | 图像转述 | ✅ 可选 | ✅ |
+| LLM 请求图片压缩 | ✅ 可选、可调 | ✅ 全局配置 |
 | 注入位置 | 用户消息 | 系统提示词 |
 
 **本插件可完全替代框架内置 LTM 的群聊记录功能，且功能更强大。**
@@ -138,6 +142,29 @@ provider_settings:
 
 **注意**：启用图像转述后，每张图片会调用一次 LLM，会产生额外费用和延迟。
 
+### LLM 请求图片压缩
+
+`llm_image_compress` 默认关闭。开启后, 插件只在图片即将进入 LLM 请求时生成临时压缩副本, 原始图片和 Bot 生成的 4K 文件不会被修改。该功能独立于场景上下文开关, 私聊或关闭 `enable` 时仍可单独使用。
+
+| 配置 | 说明 | 默认值 |
+|------|------|--------|
+| `llm_image_compress.enable` | 启用 LLM 请求图片压缩 | `false` |
+| `llm_image_compress.min_size_mb` | 文件达到该大小时触发压缩 | `4.0` |
+| `llm_image_compress.max_edge` | 压缩后最长边 | `2048` |
+| `llm_image_compress.quality` | JPEG 首选质量 | `90` |
+| `llm_image_compress.min_quality` | JPEG 自适应最低质量 | `75` |
+| `llm_image_compress.max_output_size_mb` | 单图目标输出大小 | `2.0` |
+| `llm_image_compress.max_input_size_mb` | 允许处理的单图大小上限 | `50.0` |
+| `llm_image_compress.download_retries` | 远程图片下载尝试次数 | `3` |
+| `llm_image_compress.download_timeout` | 单次远程下载超时秒数 | `15` |
+
+处理规则:
+
+- 文件达到体积阈值, 或最长边超过 `max_edge` 时才压缩。
+- 普通静态图输出 JPEG; 带透明通道的图片保持 PNG; 动图保持原样。
+- 输出超过目标大小时, 先逐步降低 JPEG 质量, 再逐步缩小分辨率。
+- 下载或压缩失败时保留原引用, 不会阻断正常对话。
+
 ### 图片上下文增强
 
 即使群友发送图片时没有触发 Bot，本插件也会记录图片消息。后续触发 LLM 时，会从最近 `image_context_window` 条消息里提取图片，单独进入 `<recent_images>` 区块：
@@ -156,8 +183,8 @@ provider_settings:
 
 - **内存安全**：LRU 淘汰机制，严格限制消息和会话数量上限
 - **高效稳定**：纯规则分析，图像转述为可选功能
-- **无侵入性**：只做加法，不修改框架原有信息
-- **可持久运行**：无内存泄漏风险
+- **无侵入性**：场景注入不覆盖框架提示; 图片压缩只替换本次 LLM 请求使用的临时副本
+- **可持久运行**：会话、图片描述和下载缓存均有容量或 TTL 清理机制
 
 ---
 
@@ -167,6 +194,7 @@ provider_settings:
 2. 在 LLM 请求前注入结构化场景描述
 3. 告诉 LLM：这条消息是对谁说的、你是被叫的还是主动插话的
 4. (可选) 将群友发送的图片转为文字描述
+5. (可选) 在图片进入 LLM 请求前生成受控大小的临时压缩副本
 
 ---
 
