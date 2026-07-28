@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.3.1 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.3.3 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.3.1 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.3.3 更新:
+- [FIX] `/reset` 和 `/new` 在记录消息前清空插件上下文，覆盖第三方 Agent runner
+- [FIX] 兼容 `astrbot_plugin_cmdmask` 的伪装指令，按真实 target 清理上下文
 
 v3.3.1 更新:
 - [FIX] 修复 issue #1：平台以 base64 data URI 传入图片时触发 [Errno 36] File name too long
@@ -38,7 +42,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.3.1
+Version: 3.3.3
 """
 
 from __future__ import annotations
@@ -94,6 +98,16 @@ class ExtraKeys:
     GEMINI_STT_CACHE_ONLY: Final[str] = "_gemini_stt_cache_only"
     GEMINI_STT_SHOULD_REPLY: Final[str] = "_gemini_stt_should_reply"
     GEMINI_STT_REPLY_REASON: Final[str] = "_gemini_stt_reply_reason"
+
+    # AstrBot 4.x uses the group-context marker; keep the legacy marker for
+    # compatibility with older AstrBot builds and third-party command hooks.
+    SESSION_CLEAN_GROUP: Final[str] = "_clean_group_context_session"
+    SESSION_CLEAN_LEGACY: Final[str] = "_clean_ltm_session"
+
+    # astrbot_plugin_cmdmask stores the resolved command here after replacing
+    # a configured alias (for example, "/wipe" -> "/reset").
+    CMDMASK_APPLIED: Final[str] = "__astrbot_plugin_cmdmask:applied"
+    CMDMASK_TARGET: Final[str] = "__astrbot_plugin_cmdmask:target"
     
     # 场景注入标记，防止重复注入
     SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
@@ -1392,7 +1406,7 @@ class Main(star.Star):
         self._image_caption_errors = 0
         self._image_caption_cache_hits = 0
 
-        version = "3.3.1"
+        version = "3.3.3"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -1465,6 +1479,46 @@ class Main(star.Star):
         if self._group_only and event.is_private_chat():
             return False
         return True
+
+    @staticmethod
+    def _extract_command_name(text: Any) -> str:
+        """提取已经过 WakingCheck 归一化文本中的首个命令名。"""
+        if not isinstance(text, str):
+            return ""
+        token = re.split(r"\s+", text.strip(), maxsplit=1)[0]
+        return token.lstrip("/.!！。").casefold()
+
+    def _session_reset_command(self, event: AstrMessageEvent) -> str:
+        """识别原生命令和 cmdmask 解析后的 reset/new 命令。"""
+        if not getattr(event, "is_at_or_wake_command", False):
+            return ""
+
+        try:
+            if event.get_extra(ExtraKeys.CMDMASK_APPLIED, False):
+                target = event.get_extra(ExtraKeys.CMDMASK_TARGET, "")
+                command_name = self._extract_command_name(target)
+                if command_name in {"reset", "new"}:
+                    return command_name
+
+            command_name = self._extract_command_name(event.get_message_str())
+            if command_name in {"reset", "new"}:
+                return command_name
+        except Exception:
+            # A third-party event implementation must not break message flow.
+            return ""
+        return ""
+
+    async def _clear_session_context(
+        self,
+        event: AstrMessageEvent,
+        reason: str,
+    ) -> None:
+        removed = await self._sessions.remove_session_async(event.unified_msg_origin)
+        if removed:
+            logger.info(
+                f"[ContextAware] 检测到 {reason}，已清理 "
+                f"{event.unified_msg_origin} 的 {removed} 条上下文记录"
+            )
 
     def _builtin_ltm_enabled(self, event: AstrMessageEvent) -> bool:
         """检测 AstrBot 内置群聊上下文感知是否启用，避免重复注入。"""
@@ -2205,6 +2259,13 @@ class Main(star.Star):
         if not self._should_process(event):
             return
 
+        # Clear before recording the command itself. This covers AstrBot
+        # third-party Agent runners, which may not emit the normal clean marker.
+        reset_command = self._session_reset_command(event)
+        if reset_command:
+            await self._clear_session_context(event, f"/{reset_command} 命令")
+            return
+
         message_outline = _event_message_outline(event)
         messages = event.get_messages()
         has_content = any(isinstance(c, (Plain, Image)) for c in messages)
@@ -2480,12 +2541,17 @@ class Main(star.Star):
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
         """跟随系统 reset/new/switch 清空本插件会话上下文（不注册新指令，避免冲突）"""
         try:
-            if event.get_extra("_clean_ltm_session", False):
-                removed = await self._sessions.remove_session_async(event.unified_msg_origin)
-                if removed:
-                    logger.info(
-                        f"[ContextAware] 检测到会话清空标记，已清理 {event.unified_msg_origin} 的 {removed} 条上下文记录"
-                    )
+            clean_marker = (
+                ExtraKeys.SESSION_CLEAN_GROUP
+                if event.get_extra(ExtraKeys.SESSION_CLEAN_GROUP, False)
+                else ExtraKeys.SESSION_CLEAN_LEGACY
+                if event.get_extra(ExtraKeys.SESSION_CLEAN_LEGACY, False)
+                else ""
+            )
+            reset_command = self._session_reset_command(event)
+            if clean_marker or reset_command:
+                reason = clean_marker or f"/{reset_command} 命令"
+                await self._clear_session_context(event, reason)
         except Exception as e:
             logger.error(f"[ContextAware] 清理会话失败: {e}")
 

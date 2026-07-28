@@ -84,8 +84,12 @@ help: |
   - [FIX] 强化主动触发+Bot推断场景的 instruction，LLM 现在会更保守地判断是否需要回复
   - [CONFIG] 新增 strict_mode：开启后主动/未知触发场景强制不推断 talking_to=bot，彻底减少误回复
 
+  v3.3.3 更新：
+  - [FIX] `/reset` 和 `/new` 在记录消息前清空插件上下文，兼容第三方 Agent runner
+  - [FIX] 兼容 `astrbot_plugin_cmdmask` 伪装指令，通过其 target extra 识别真实命令
+
   配置说明请查看插件配置页面。
-version: 3.3.1
+version: 3.3.3
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"

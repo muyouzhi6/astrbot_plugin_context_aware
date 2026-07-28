@@ -1,5 +1,11 @@
 # 上下文场景感知增强
 
+## v3.3.3
+
+- 修复 `/new` 和 `/reset` 后插件上下文未清理的问题, 覆盖第三方 Agent runner。
+- 兼容 AstrBot 当前的 `_clean_group_context_session` 信号, 并保留旧版 `_clean_ltm_session` 兼容。
+- 兼容 `astrbot_plugin_cmdmask` 的伪装指令, 根据插件提供的真实 target 清理上下文。
+
 **让你的 Bot 在群聊中不再"抢答"别人的问题**
 
 ---

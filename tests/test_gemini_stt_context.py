@@ -144,6 +144,7 @@ class FakeEvent:
     def __init__(self):
         self.message_obj = FakeMessageObj()
         self.message_str = ""
+        self.is_at_or_wake_command = False
         self.unified_msg_origin = "aiocqhttp:group:200"
         self.extras = {
             "_gemini_stt_transcript": "大家等会儿看一下这个配置",
@@ -172,7 +173,7 @@ class FakeEvent:
         return ""
 
     def get_message_str(self):
-        return ""
+        return self.message_str
 
     def is_private_chat(self):
         return False
@@ -218,6 +219,74 @@ class ContextAwareGeminiSTTTest(unittest.IsolatedAsyncioTestCase):
         await plugin.on_message(event)
 
         self.assertTrue(plugin._sessions.has_session(event.unified_msg_origin))
+
+    async def test_reset_and_new_commands_clear_before_command_is_recorded(self):
+        for command in ("reset", "new"):
+            plugin = self.mod.Main(FakeContext(), {"enable": True, "only_group_chat": True})
+            history = self.mod.MessageRecord(
+                msg_id=f"before-{command}",
+                sender_id="100",
+                sender_name="Alice",
+                content="旧上下文",
+                timestamp=1.0,
+            )
+            await plugin._sessions.add_message_async("aiocqhttp:group:200", history)
+
+            event = FakeEvent()
+            event.message_str = command
+            event.is_at_or_wake_command = True
+
+            await plugin.on_message(event)
+
+            self.assertFalse(plugin._sessions.has_session(event.unified_msg_origin))
+
+    async def test_cmdmask_target_clears_context_for_a_disguised_command(self):
+        plugin = self.mod.Main(FakeContext(), {"enable": True, "only_group_chat": True})
+        await plugin._sessions.add_message_async(
+            "aiocqhttp:group:200",
+            self.mod.MessageRecord(
+                msg_id="before-masked-reset",
+                sender_id="100",
+                sender_name="Alice",
+                content="旧上下文",
+                timestamp=1.0,
+            ),
+        )
+
+        event = FakeEvent()
+        event.message_str = "今天天气真好"
+        event.is_at_or_wake_command = True
+        event.extras.update(
+            {
+                self.mod.ExtraKeys.CMDMASK_APPLIED: True,
+                self.mod.ExtraKeys.CMDMASK_TARGET: "reset",
+            },
+        )
+
+        await plugin.on_message(event)
+
+        self.assertFalse(plugin._sessions.has_session(event.unified_msg_origin))
+
+    async def test_after_message_sent_keeps_marker_compatibility(self):
+        plugin = self.mod.Main(FakeContext(), {"enable": True, "only_group_chat": True})
+        await plugin._sessions.add_message_async(
+            "aiocqhttp:group:200",
+            self.mod.MessageRecord(
+                msg_id="before-marker",
+                sender_id="100",
+                sender_name="Alice",
+                content="旧上下文",
+                timestamp=1.0,
+            ),
+        )
+
+        event = FakeEvent()
+        event.is_at_or_wake_command = True
+        event.extras[self.mod.ExtraKeys.SESSION_CLEAN_GROUP] = True
+
+        await plugin.after_message_sent(event)
+
+        self.assertFalse(plugin._sessions.has_session(event.unified_msg_origin))
 
     async def test_llm_request_fallback_and_message_handler_do_not_duplicate_voice(self):
         plugin = self.mod.Main(FakeContext(), {"enable": True, "only_group_chat": True})
