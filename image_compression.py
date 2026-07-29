@@ -195,7 +195,7 @@ def compress_local_image(
                             candidate_path,
                             "PNG",
                             optimize=True,
-                            compress_level=9,
+                            compress_level=6,
                         )
                         output_bytes = candidate_path.stat().st_size
                     else:

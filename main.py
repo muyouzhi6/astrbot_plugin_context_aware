@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.4.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.4.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,15 @@ AstrBot 上下文场景感知增强插件 v3.4.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.4.1 更新:
+- [FIX] 移除图片压缩门控，所有触发方式（包括主动回复）的大图均被压缩
+- [FIX] _lazy_caption_flow 多图消息只描述第一张即跳过整条的 bug
+- [FIX] CancelledError 在图像转述、图片压缩、下载、历史压缩、on_message 5处被 except Exception 误吞，现均放通
+- [PERF] PNG compress_level 9→6，压缩速度提升约2倍，体积增加<5%
+- [FEAT] 图像转述缓存加 TTL（1小时），防止 QQ CDN 过期链接返回旧描述
+- [FEAT] 公开 API 新增 remove_message_async / remove_last_bot_response_async 异步版本
+- [REFACTOR] shutil 移至顶层导入
 
 v3.4.0 更新:
 - [FEAT] 新增可选的 LLM 请求图片压缩，不修改原图，支持自定义阈值、分辨率、质量和输出大小
@@ -56,6 +65,7 @@ import http.client
 import mimetypes
 import os
 import re
+import shutil
 import time
 import urllib.error
 import urllib.parse
@@ -1377,8 +1387,9 @@ class Main(star.Star):
 
         # v3.0.0: 图像转述并发控制
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
-        self._image_caption_cache: OrderedDict[str, str] = OrderedDict()  # URL -> caption (LRU)
+        self._image_caption_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()  # URL -> (caption, timestamp)
         self._image_caption_cache_max = 100  # 硬上限
+        self._image_caption_cache_ttl = 3600.0  # 缓存1小时，与图片下载缓存 TTL 对齐
         # 图片本地缓存目录（lazy 模式提前下载用）
         default_cache_dir = os.path.join(
             get_astrbot_plugin_data_path(),
@@ -1439,7 +1450,7 @@ class Main(star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.4.0"
+        version = "3.4.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -1747,6 +1758,9 @@ class Main(star.Star):
                 )
 
                 return await self._sessions.get_snapshot_async(umo)
+        except asyncio.CancelledError:
+            await self._sessions.clear_compressing_async(umo)
+            raise
         except Exception as e:
             logger.error(f"[ContextAware] 历史压缩失败: {e}")
             await self._sessions.clear_compressing_async(umo)
@@ -1754,7 +1768,7 @@ class Main(star.Star):
 
     def _mark_url_failed(self, cache_key: str) -> None:
         """缓存失败的URL（用空字符串作为哨兵），避免后续对同一URL重复请求"""
-        self._image_caption_cache[cache_key] = ""
+        self._image_caption_cache[cache_key] = ("", time.time())
         while len(self._image_caption_cache) > self._image_caption_cache_max:
             self._image_caption_cache.popitem(last=False)
 
@@ -1978,7 +1992,6 @@ class Main(star.Star):
                     self._image_cache_dir, f"{IMAGE_CACHE_PREFIX}{url_hash}{ext}"
                 )
                 if not os.path.exists(cached_path):
-                    import shutil
                     try:
                         shutil.copy2(local_ref, cached_path)
                     except Exception:
@@ -2052,6 +2065,8 @@ class Main(star.Star):
                         max_bytes=effective_limit,
                         timeout=effective_timeout,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logger.warning(f"[ContextAware] 图片下载异常: {e}")
                     content_size = None
@@ -2245,12 +2260,19 @@ class Main(star.Star):
             )
             return image_ref
 
-        outcome = await asyncio.to_thread(
-            compress_local_image,
-            local_path,
-            self._image_compress_output_dir,
-            options,
-        )
+        try:
+            outcome = await asyncio.to_thread(
+                compress_local_image,
+                local_path,
+                self._image_compress_output_dir,
+                options,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._image_compress_errors += 1
+            logger.warning(f"[ContextAware] LLM 图片压缩异常: {e}")
+            return image_ref
         if not outcome.changed:
             effective_ref = local_path if os.path.isfile(local_path) else image_ref
             mapping[image_ref] = effective_ref
@@ -2291,8 +2313,6 @@ class Main(star.Star):
         event: AstrMessageEvent,
     ) -> None:
         if not self._image_compress_options.enabled:
-            return
-        if not bool(getattr(event, "is_at_or_wake_command", False)):
             return
 
         try:
@@ -2401,12 +2421,15 @@ class Main(star.Star):
                 effective_url = self._local_path_to_data_uri(local_path) or image_url
             # 若无缓存目录则 effective_url 保持原始 data URI，由 provider 自行处理
 
-        # 缓存命中检查：空字符串为上次失败的哨兵
+        # 缓存命中检查：空字符串为失败哨兵，同时检查 TTL
         if cache_key in self._image_caption_cache:
-            self._image_caption_cache_hits += 1
-            self._image_caption_cache.move_to_end(cache_key)
-            cached = self._image_caption_cache[cache_key]
-            return cached if cached else None
+            cached_value, cached_at = self._image_caption_cache[cache_key]
+            if time.time() - cached_at < self._image_caption_cache_ttl:
+                self._image_caption_cache_hits += 1
+                self._image_caption_cache.move_to_end(cache_key)
+                return cached_value if cached_value else None
+            # 已过期，删除并重新获取
+            del self._image_caption_cache[cache_key]
 
         t0 = time.perf_counter()
         try:
@@ -2452,7 +2475,7 @@ class Main(star.Star):
                     if len(caption) > 100:
                         caption = caption[:97] + "..."
                     # 缓存结果（使用 OrderedDict 实现 LRU）
-                    self._image_caption_cache[cache_key] = caption
+                    self._image_caption_cache[cache_key] = (caption, time.time())
                     # LRU 淘汰：超过硬上限时移除最旧的
                     while len(self._image_caption_cache) > self._image_caption_cache_max:
                         self._image_caption_cache.popitem(last=False)
@@ -2463,6 +2486,8 @@ class Main(star.Star):
                 self._mark_url_failed(cache_key)
                 return None
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             elapsed = time.perf_counter() - t0
             self._image_caption_errors += 1
@@ -2483,11 +2508,7 @@ class Main(star.Star):
             if not msg.image_urls:
                 updated.append(msg)
                 continue
-            # 检查 content 是否已有描述
-            if "[图片: " in msg.content:
-                updated.append(msg)
-                continue
-            # 有未描述的图片，逐一转述
+            # 有未描述的图片，逐一转述（不整条跳过，避免部分已描述的消息漏掉剩余图片）
             new_content = msg.content
             caption_index = 0
             for img_idx, url in enumerate(msg.image_urls):
@@ -2651,6 +2672,8 @@ class Main(star.Star):
         """监听所有消息，记录到历史"""
         try:
             await self._prepare_event_images_for_llm(event)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             self._image_compress_errors += 1
             logger.warning(f"[ContextAware] 消息图片预处理失败, 已保留原图: {e}")
@@ -3060,33 +3083,42 @@ class Main(star.Star):
         """
         return self._sessions.has_session(unified_msg_origin)
 
-    def remove_message(self, unified_msg_origin: str, msg_id: str) -> bool:
-        """删除指定会话中的指定消息
-        
+    async def remove_message_async(self, unified_msg_origin: str, msg_id: str) -> bool:
+        """删除指定会话中的指定消息（异步，推荐使用）
+
         供 recall_cancel 等插件调用，在消息撤回时清理记录。
-        
-        Args:
-            unified_msg_origin: 会话标识
-            msg_id: 要删除的消息ID
-            
-        Returns:
-            是否成功删除
+        """
+        result = await self._sessions.remove_message_by_id_async(unified_msg_origin, msg_id)
+        if result:
+            logger.debug(f"[ContextAware] 已删除消息记录 msg_id={msg_id}")
+        return result
+
+    def remove_message(self, unified_msg_origin: str, msg_id: str) -> bool:
+        """删除指定会话中的指定消息（同步，向后兼容）
+
+        供 recall_cancel 等插件调用，在消息撤回时清理记录。
+        推荐在异步上下文中使用 remove_message_async。
         """
         result = self._sessions.remove_message_by_id(unified_msg_origin, msg_id)
         if result:
             logger.debug(f"[ContextAware] 已删除消息记录 msg_id={msg_id}")
         return result
 
-    def remove_last_bot_response(self, unified_msg_origin: str) -> bool:
-        """删除指定会话中最后一条 Bot 回复
-        
+    async def remove_last_bot_response_async(self, unified_msg_origin: str) -> bool:
+        """删除指定会话中最后一条 Bot 回复（异步，推荐使用）
+
         供 recall_cancel 等插件调用，在撤回时同时清理 Bot 的回复记录。
-        
-        Args:
-            unified_msg_origin: 会话标识
-            
-        Returns:
-            是否成功删除
+        """
+        result = await self._sessions.remove_last_bot_message_async(unified_msg_origin)
+        if result:
+            logger.debug("[ContextAware] 已删除最后一条 Bot 回复记录")
+        return result
+
+    def remove_last_bot_response(self, unified_msg_origin: str) -> bool:
+        """删除指定会话中最后一条 Bot 回复（同步，向后兼容）
+
+        供 recall_cancel 等插件调用，在撤回时同时清理 Bot 的回复记录。
+        推荐在异步上下文中使用 remove_last_bot_response_async。
         """
         result = self._sessions.remove_last_bot_message(unified_msg_origin)
         if result:

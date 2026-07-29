@@ -91,7 +91,7 @@ help: |
   - [FIX] 兼容 `astrbot_plugin_cmdmask` 伪装指令，通过其 target extra 识别真实命令
 
   配置说明请查看插件配置页面。
-version: 3.4.0
+version: 3.4.1
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"
