@@ -59,6 +59,26 @@ provider_settings:
 
 ---
 
+## 推荐联动插件
+
+以下插件都不是本插件的硬依赖，可以单独安装和使用。组合后可以补足消息真实性判断和自主沉默能力，让群聊上下文不仅完整，而且更可信、更克制。
+
+### [消息真实性校验](https://github.com/muyouzhi6/astrbot_plugin_message_authenticity)
+
+- 识别普通文本伪造的 `[图片]`、`[红包]`、`[转账]` 等标签，并校验 OneBot/NapCat 上报的真实结构化消息。
+- 检测到真实红包或转账事件时，会将可读描述写入 Context Aware 会话，让 Bot 在后续对话中知道“谁、何时、发了什么”。
+- 该联动是软依赖；未安装 Context Aware 时，消息真实性校验仍可独立工作。
+- 真实红包事件只代表平台上报了可信的钱包结构，不代表 Bot 已领取红包或资金已经到账。
+
+### [算了不说了](https://github.com/muyouzhi6/astrbot_plugin_suanle_bushuo)
+
+- Context Aware 提供完整的群聊场景和对话对象判断，`算了不说了` 提供 `keep_silent` 工具，让 LLM 在不该插话或无需回复时主动保持沉默。
+- 支持黑名单强阻断，同时仍将被阻断用户的消息作为 `<blocked_messages>` 临时上下文提供给 LLM，避免群聊信息断裂。
+- 黑名单上下文由 `算了不说了` 独立维护，不调用 Context Aware 的清理接口，两个插件各自负责自己的数据边界。
+- `keep_silent` 依赖模型的 function-calling/tools-use 能力；不支持工具调用的模型无法保证自主沉默。
+
+---
+
 ## 功能对比
 
 | 功能 | 本插件 | 框架内置 LTM |
