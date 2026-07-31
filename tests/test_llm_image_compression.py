@@ -273,6 +273,128 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(Path(image_component.url).exists())
             self.assertIn(image_component.url, event.tracked)
 
+    async def test_quoted_image_files_are_promoted_by_content(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = self.mod.Main(
+                FakeContext(),
+                {
+                    "enable": False,
+                    "image_cache_dir": str(Path(root) / "cache"),
+                    "llm_image_compress": {"enable": False},
+                },
+            )
+
+            try:
+                for suffix, image_format in (
+                    ("png", "PNG"),
+                    ("jpg", "JPEG"),
+                    ("webp", "WEBP"),
+                    ("gif", "GIF"),
+                    ("bmp", "BMP"),
+                    ("tiff", "TIFF"),
+                ):
+                    with self.subTest(image_format=image_format):
+                        source = Path(root) / f"quoted.{suffix}"
+                        image = Image.new("RGB", (32, 24), (12, 34, 56))
+                        image.save(source, image_format)
+                        image.close()
+
+                        file_component = self.mod.File(
+                            name=source.name,
+                            file=str(source),
+                        )
+                        reply_component = self.mod.Reply()
+                        reply_component.chain = [file_component]
+                        event = FakeCompressionEvent(private=True)
+                        event.get_messages = lambda: [reply_component]
+
+                        await plugin.on_message(event)
+                        await plugin.on_message(event)
+
+                        promoted = reply_component.chain[0]
+                        self.assertIsInstance(promoted, self.mod.Image)
+                        self.assertEqual(Path(promoted.path).resolve(), source.resolve())
+                        self.assertEqual(file_component.get_file_calls, 1)
+            finally:
+                await plugin.terminate()
+
+    async def test_quoted_file_uses_real_content_instead_of_extension(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = self.mod.Main(
+                FakeContext(),
+                {
+                    "enable": False,
+                    "image_cache_dir": str(Path(root) / "cache"),
+                    "llm_image_compress": {"enable": False},
+                },
+            )
+            real_image = Path(root) / "image.data"
+            image = Image.new("RGB", (16, 16), (90, 80, 70))
+            image.save(real_image, "PNG")
+            image.close()
+            fake_image = Path(root) / "not-an-image.png"
+            fake_image.write_text("not an image", encoding="utf-8")
+
+            real_file = self.mod.File(name="image.data", file=str(real_image))
+            fake_file = self.mod.File(name="not-an-image.png", file=str(fake_image))
+            reply_component = self.mod.Reply()
+            reply_component.chain = [real_file, fake_file]
+            event = FakeCompressionEvent(private=True)
+            event.get_messages = lambda: [reply_component]
+
+            try:
+                await plugin.on_message(event)
+            finally:
+                await plugin.terminate()
+
+            self.assertIsInstance(reply_component.chain[0], self.mod.Image)
+            self.assertIs(reply_component.chain[1], fake_file)
+
+    async def test_promoted_quoted_file_is_compressed_once_across_hooks(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "quoted-file.jpg"
+            _make_noisy_jpeg(source)
+            plugin = self.mod.Main(
+                FakeContext(),
+                {
+                    "enable": False,
+                    "image_cache_dir": str(Path(root) / "cache"),
+                    "llm_image_compress": {
+                        "enable": True,
+                        "min_size_mb": 0.1,
+                        "max_edge": 1024,
+                        "max_output_size_mb": 1,
+                    },
+                },
+            )
+            plugin._image_compress_output_dir = str(Path(root) / "output")
+            file_component = self.mod.File(name=source.name, file=str(source))
+            reply_component = self.mod.Reply()
+            reply_component.chain = [file_component]
+            event = FakeCompressionEvent(private=True)
+            event.get_messages = lambda: [reply_component]
+
+            try:
+                with patch.object(
+                    self.mod,
+                    "compress_local_image",
+                    wraps=self.mod.compress_local_image,
+                ) as compress:
+                    await plugin.on_message(event)
+                    promoted = reply_component.chain[0]
+                    req = types.SimpleNamespace(
+                        image_urls=[plugin._component_image_ref(promoted)],
+                        extra_user_content_parts=[],
+                    )
+                    await plugin.on_llm_request(event, req)
+            finally:
+                await plugin.terminate()
+
+            self.assertIsInstance(promoted, self.mod.Image)
+            self.assertEqual(file_component.get_file_calls, 1)
+            self.assertEqual(compress.call_count, 1)
+            self.assertEqual(plugin._image_compress_count, 1)
+
     async def test_data_uri_is_materialized_compressed_and_not_processed_twice(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "inline.jpg"

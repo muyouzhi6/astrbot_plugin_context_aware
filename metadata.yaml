@@ -12,6 +12,10 @@ help: |
   - Bot状态：上次发言时间
   - 图像转述：可选功能，将群友发送的图片转为文字描述
 
+  v3.4.2 更新：
+  - [FIX] 引用消息中的图片文件按真实内容归一化为 Image，避免重复回查 OneBot
+  - [FEAT] 自动支持 Pillow 可识别的 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO 等格式
+
   v3.1.6 更新：
   - [FIX] 语音转写独立上下文窗口，避免高频群聊把未回复语音挤出最近对话流
   - [CONFIG] 新增 voice_context_window，默认从最近 50 条消息中单独提取语音转写
@@ -91,7 +95,7 @@ help: |
   - [FIX] 兼容 `astrbot_plugin_cmdmask` 伪装指令，通过其 target extra 识别真实命令
 
   配置说明请查看插件配置页面。
-version: 3.4.1
+version: 3.4.2
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"

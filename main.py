@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.4.1 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.4.2 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.4.1 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.4.2 更新:
+- [FIX] 引用消息中的图片文件按真实内容归一化为 Image，避免 Core 重复回查 OneBot
+- [FEAT] 自动支持 Pillow 可识别的 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO 等图片格式
 
 v3.4.1 更新:
 - [FIX] 移除图片压缩门控，所有触发方式（包括主动回复）的大图均被压缩
@@ -53,7 +57,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.4.0
+Version: 3.4.2
 """
 
 from __future__ import annotations
@@ -78,9 +82,10 @@ from typing import TYPE_CHECKING, Any, Final, final
 from astrbot import logger
 from astrbot.api import star
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
+from astrbot.api.message_components import At, AtAll, File, Image, Plain, Reply
 from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
+from PIL import Image as PILImage
 
 try:
     from astrbot.core.utils.astrbot_path import (
@@ -1450,7 +1455,7 @@ class Main(star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.4.1"
+        version = "3.4.2"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -2200,6 +2205,26 @@ class Main(star.Star):
                     pass
 
     @staticmethod
+    def _detect_local_image_format(image_path: str) -> str | None:
+        """Detect an image format from decoded file contents.
+
+        Args:
+            image_path: Local file path to inspect.
+
+        Returns:
+            The Pillow image format name, or ``None`` for non-image files.
+        """
+        try:
+            with PILImage.open(image_path) as image:
+                image.verify()
+                image_format = str(image.format or "").upper()
+        except Exception:
+            return None
+
+        mime_type = PILImage.MIME.get(image_format, "")
+        return image_format if mime_type.startswith("image/") else None
+
+    @staticmethod
     def _track_temporary_image(event: AstrMessageEvent, image_path: str) -> None:
         tracker = getattr(event, "track_temporary_local_file", None)
         if callable(tracker):
@@ -2312,9 +2337,6 @@ class Main(star.Star):
         self,
         event: AstrMessageEvent,
     ) -> None:
-        if not self._image_compress_options.enabled:
-            return
-
         try:
             messages = event.get_messages()
         except Exception:
@@ -2322,6 +2344,8 @@ class Main(star.Star):
 
         for component in messages:
             if isinstance(component, Image):
+                if not self._image_compress_options.enabled:
+                    continue
                 source_ref = self._component_image_ref(component)
                 compressed_ref = await self._compress_image_reference(
                     event,
@@ -2330,8 +2354,39 @@ class Main(star.Star):
                 if compressed_ref != source_ref:
                     self._replace_component_image_ref(component, compressed_ref)
             elif isinstance(component, Reply):
-                for reply_component in getattr(component, "chain", None) or []:
+                reply_chain = getattr(component, "chain", None) or []
+                for index, reply_component in enumerate(reply_chain):
+                    if isinstance(reply_component, File):
+                        try:
+                            local_path = await reply_component.get_file()
+                            if not local_path or not os.path.isfile(local_path):
+                                continue
+                            image_format = await asyncio.to_thread(
+                                self._detect_local_image_format,
+                                local_path,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.warning(
+                                f"[ContextAware] 引用文件图片识别失败, 已保留原文件: {e}"
+                            )
+                            continue
+
+                        if not image_format:
+                            continue
+
+                        promoted_image = Image.fromFileSystem(local_path)
+                        reply_chain[index] = promoted_image
+                        reply_component = promoted_image
+                        logger.info(
+                            f"[ContextAware] 引用图片文件已归一化: "
+                            f"{os.path.basename(local_path)} ({image_format})"
+                        )
+
                     if not isinstance(reply_component, Image):
+                        continue
+                    if not self._image_compress_options.enabled:
                         continue
                     source_ref = self._component_image_ref(reply_component)
                     compressed_ref = await self._compress_image_reference(

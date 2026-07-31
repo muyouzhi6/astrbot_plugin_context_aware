@@ -75,6 +75,9 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
             self.url = url
             self.file = file
 
+    class File:
+        pass
+
     class At:
         def __init__(self, qq: str, name: str = ""):
             self.qq = qq
@@ -101,6 +104,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
     provider_mod.ProviderRequest = ProviderRequest
     agent_message_mod.TextPart = TextPart
     message_components_mod.Plain = Plain
+    message_components_mod.File = File
     message_components_mod.Image = Image
     message_components_mod.At = At
     message_components_mod.AtAll = AtAll

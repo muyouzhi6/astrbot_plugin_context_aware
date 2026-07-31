@@ -72,9 +72,26 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
             self.text = text
 
     class Image:
-        def __init__(self, url: str = "", file: str = ""):
+        def __init__(self, url: str = "", file: str = "", path: str = ""):
             self.url = url
             self.file = file
+            self.path = path
+
+        @staticmethod
+        def fromFileSystem(path: str):
+            resolved = Path(path).resolve()
+            return Image(file=resolved.as_uri(), path=str(resolved))
+
+    class File:
+        def __init__(self, name: str, file: str = "", url: str = ""):
+            self.name = name
+            self.file_ = file
+            self.url = url
+            self.get_file_calls = 0
+
+        async def get_file(self):
+            self.get_file_calls += 1
+            return self.file_
 
     class At:
         def __init__(self, qq: str, name: str = ""):
@@ -87,6 +104,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
     class Reply:
         def __init__(self, sender_id: str = ""):
             self.sender_id = sender_id
+            self.chain = []
 
     astrbot_mod.logger = Logger()
     api_mod.star = StarNamespace
@@ -102,6 +120,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
     provider_mod.ProviderRequest = ProviderRequest
     agent_message_mod.TextPart = TextPart
     message_components_mod.Plain = Plain
+    message_components_mod.File = File
     message_components_mod.Image = Image
     message_components_mod.At = At
     message_components_mod.AtAll = AtAll
