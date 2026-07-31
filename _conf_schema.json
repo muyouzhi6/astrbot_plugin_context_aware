@@ -57,7 +57,7 @@
     "description": "允许将GIF图片消息加入最近图片上下文",
     "type": "bool",
     "default": false,
-    "hint": "仅当后续模型支持image/gif或你确认需要GIF上下文时开启；关闭时GIF不会进入<recent_images>，也不会触发图像转述",
+    "hint": "仅控制<recent_images>和图像转述；关闭时GIF不会进入该场景区块。AstrBot持久化历史中的GIF由已启用的LLM请求图片压缩提取首帧为PNG",
     "condition": {
       "show_recent_images": true
     }

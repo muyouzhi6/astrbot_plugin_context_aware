@@ -137,11 +137,17 @@ def compress_local_image(
     try:
         with PILImage.open(path) as opened_image:
             source_size = opened_image.size
-            if getattr(opened_image, "is_animated", False) or getattr(
-                opened_image,
-                "n_frames",
-                1,
-            ) > 1:
+            image_format = str(opened_image.format or "").upper()
+            is_gif = image_format == "GIF"
+            if not is_gif and (
+                getattr(opened_image, "is_animated", False)
+                or getattr(
+                    opened_image,
+                    "n_frames",
+                    1,
+                )
+                > 1
+            ):
                 return _unchanged(
                     source_path,
                     source_bytes=source_bytes,
@@ -149,7 +155,7 @@ def compress_local_image(
                     reason="animated_image",
                 )
 
-            if (
+            if not is_gif and (
                 source_bytes < options.min_size_bytes
                 and max(source_size) <= options.max_edge
             ):
@@ -160,9 +166,11 @@ def compress_local_image(
                     reason="below_threshold",
                 )
 
+            if is_gif:
+                opened_image.seek(0)
             working_image = ImageOps.exif_transpose(opened_image)
             working_image.load()
-            alpha = _has_alpha(working_image)
+            alpha = is_gif or _has_alpha(working_image)
             suffix = ".png" if alpha else ".jpg"
 
             destination = Path(output_dir)
@@ -240,7 +248,7 @@ def compress_local_image(
                 )
 
             output_bytes = candidate_path.stat().st_size
-            if output_bytes >= source_bytes:
+            if output_bytes >= source_bytes and not is_gif:
                 candidate_path.unlink(missing_ok=True)
                 return _unchanged(
                     source_path,
@@ -258,9 +266,13 @@ def compress_local_image(
                 output_size=output_size,
                 changed=True,
                 reason=(
-                    "compressed"
-                    if output_bytes <= options.max_output_bytes
-                    else "compressed_above_target"
+                    "gif_first_frame"
+                    if is_gif
+                    else (
+                        "compressed"
+                        if output_bytes <= options.max_output_bytes
+                        else "compressed_above_target"
+                    )
                 ),
             )
     except Exception as exc:  # noqa: BLE001

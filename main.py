@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.4.2 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.4.3 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.4.2 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.4.3 更新:
+- [FIX] LLM 请求图片预处理覆盖持久化历史 contexts，避免旧图片绕过压缩链
+- [FIX] GIF 在请求侧提取首帧为 PNG 临时副本，兼容不支持 image/gif 的模型
 
 v3.4.2 更新:
 - [FIX] 引用消息中的图片文件按真实内容归一化为 Image，避免 Core 重复回查 OneBot
@@ -57,7 +61,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.4.2
+Version: 3.4.3
 """
 
 from __future__ import annotations
@@ -1455,7 +1459,7 @@ class Main(star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.4.2"
+        version = "3.4.3"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -2404,27 +2408,66 @@ class Main(star.Star):
         event: AstrMessageEvent,
         req: ProviderRequest,
     ) -> None:
-        image_urls = getattr(req, "image_urls", None)
-        if not self._image_compress_options.enabled or not isinstance(
-            image_urls,
-            list,
-        ):
+        """Prepare current and historical images for the LLM provider.
+
+        Args:
+            event: Current AstrBot message event used for temporary file tracking.
+            req: Provider request whose image references may be replaced in place.
+
+        Returns:
+            None.
+        """
+        if not self._image_compress_options.enabled:
             return
 
+        image_urls = getattr(req, "image_urls", None)
         replacements: dict[str, str] = {}
-        compressed_urls: list[str] = []
-        for image_ref in image_urls:
-            if not isinstance(image_ref, str) or not image_ref:
-                compressed_urls.append(image_ref)
-                continue
-            compressed_ref = await self._compress_image_reference(
-                event,
-                image_ref,
-            )
-            compressed_urls.append(compressed_ref)
-            if compressed_ref != image_ref:
-                replacements[image_ref] = compressed_ref
-        req.image_urls = compressed_urls
+        if isinstance(image_urls, list):
+            compressed_urls: list[str] = []
+            for image_ref in image_urls:
+                if not isinstance(image_ref, str) or not image_ref:
+                    compressed_urls.append(image_ref)
+                    continue
+                compressed_ref = await self._compress_image_reference(
+                    event,
+                    image_ref,
+                )
+                compressed_urls.append(compressed_ref)
+                if compressed_ref != image_ref:
+                    replacements[image_ref] = compressed_ref
+            req.image_urls = compressed_urls
+
+        contexts = getattr(req, "contexts", None)
+        if isinstance(contexts, list):
+            for context in contexts:
+                if not isinstance(context, dict):
+                    continue
+                content = context.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if not isinstance(part, dict) or part.get("type") != "image_url":
+                        continue
+                    image_part = part.get("image_url")
+                    if isinstance(image_part, dict):
+                        image_ref = image_part.get("url")
+                        if not isinstance(image_ref, str) or not image_ref:
+                            continue
+                        compressed_ref = await self._compress_image_reference(
+                            event,
+                            image_ref,
+                        )
+                        if compressed_ref != image_ref:
+                            image_part["url"] = compressed_ref
+                            replacements[image_ref] = compressed_ref
+                    elif isinstance(image_part, str) and image_part:
+                        compressed_ref = await self._compress_image_reference(
+                            event,
+                            image_part,
+                        )
+                        if compressed_ref != image_part:
+                            part["image_url"] = compressed_ref
+                            replacements[image_part] = compressed_ref
 
         if not replacements:
             return

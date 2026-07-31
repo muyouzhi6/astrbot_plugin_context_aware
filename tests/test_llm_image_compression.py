@@ -108,7 +108,7 @@ class ImageCompressionCoreTest(unittest.TestCase):
                 self.assertIn("A", compressed.mode)
                 self.assertLessEqual(max(compressed.size), 700)
 
-    def test_animated_image_is_left_unchanged(self):
+    def test_gif_is_converted_to_first_frame_png(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "animated.gif"
             frames = [
@@ -131,8 +131,32 @@ class ImageCompressionCoreTest(unittest.TestCase):
 
             outcome = compress_local_image(str(source), root, options)
 
-            self.assertFalse(outcome.changed)
-            self.assertEqual(outcome.reason, "animated_image")
+            self.assertTrue(outcome.changed)
+            self.assertEqual(outcome.reason, "gif_first_frame")
+            self.assertTrue(outcome.output_path.endswith(".png"))
+            with Image.open(outcome.output_path) as converted:
+                self.assertEqual(converted.format, "PNG")
+                self.assertEqual(getattr(converted, "n_frames", 1), 1)
+                self.assertEqual(
+                    converted.convert("RGB").getpixel((0, 0)),
+                    (255, 0, 0),
+                )
+
+    def test_single_frame_gif_is_converted_below_compression_threshold(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "single.gif"
+            image = Image.new("RGB", (32, 24), (12, 34, 56))
+            image.save(source, "GIF")
+            image.close()
+            options = ImageCompressionOptions.from_mapping(
+                {"enable": True, "min_size_mb": 100, "max_edge": 2048}
+            )
+
+            outcome = compress_local_image(str(source), root, options)
+
+            self.assertTrue(outcome.changed)
+            self.assertEqual(outcome.reason, "gif_first_frame")
+            self.assertTrue(outcome.output_path.endswith(".png"))
 
     def test_source_over_input_limit_is_left_unchanged(self):
         with tempfile.TemporaryDirectory() as root:
@@ -436,6 +460,78 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(req.image_urls[0], first_output)
             self.assertTrue(Path(first_output).exists())
+            self.assertEqual(plugin._image_compress_count, 1)
+
+    async def test_history_gif_is_converted_before_provider_request(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "history.gif"
+            frames = [
+                Image.new("RGB", (48, 32), color)
+                for color in ((255, 0, 0), (0, 255, 0))
+            ]
+            frames[0].save(
+                source,
+                "GIF",
+                save_all=True,
+                append_images=frames[1:],
+                duration=100,
+                loop=0,
+            )
+            for frame in frames:
+                frame.close()
+            raw = source.read_bytes()
+            data_uri = "data:image/gif;base64," + base64.b64encode(raw).decode("ascii")
+            plugin = self.mod.Main(
+                FakeContext(),
+                {
+                    "enable": False,
+                    "image_cache_dir": str(Path(root) / "cache"),
+                    "llm_image_compress": {
+                        "enable": True,
+                        "min_size_mb": 100,
+                        "max_edge": 2048,
+                        "max_output_size_mb": 5,
+                        "max_input_size_mb": 20,
+                    },
+                },
+            )
+            plugin._image_compress_output_dir = str(Path(root) / "output")
+            event = FakeCompressionEvent(private=True)
+            image_part = {
+                "type": "image_url",
+                "image_url": {"url": data_uri, "detail": "high"},
+            }
+            untouched_part = {
+                "type": "image_url",
+                "image_url": "not-a-readable-image",
+            }
+            req = types.SimpleNamespace(
+                image_urls=[],
+                contexts=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "old message"},
+                            image_part,
+                            untouched_part,
+                        ],
+                    }
+                ],
+                extra_user_content_parts=[],
+            )
+
+            try:
+                await plugin._compress_provider_request_images(event, req)
+            finally:
+                await plugin.terminate()
+
+            converted_ref = image_part["image_url"]["url"]
+            self.assertNotEqual(converted_ref, data_uri)
+            self.assertTrue(converted_ref.endswith(".png"))
+            self.assertTrue(Path(converted_ref).exists())
+            self.assertEqual(image_part["image_url"]["detail"], "high")
+            self.assertEqual(untouched_part["image_url"], "not-a-readable-image")
+            self.assertIn(converted_ref, event.tracked)
             self.assertEqual(plugin._image_compress_count, 1)
 
     async def test_remote_download_retries_until_complete(self):

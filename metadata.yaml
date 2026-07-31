@@ -12,6 +12,10 @@ help: |
   - Bot状态：上次发言时间
   - 图像转述：可选功能，将群友发送的图片转为文字描述
 
+  v3.4.3 更新：
+  - [FIX] LLM 请求图片预处理覆盖持久化历史 contexts，避免旧图片绕过压缩链
+  - [FIX] GIF 提取首帧为 PNG 临时副本，兼容不支持 image/gif 的模型
+
   v3.4.2 更新：
   - [FIX] 引用消息中的图片文件按真实内容归一化为 Image，避免重复回查 OneBot
   - [FEAT] 自动支持 Pillow 可识别的 PNG、JPEG、WebP、GIF、BMP、TIFF、ICO 等格式
@@ -95,7 +99,7 @@ help: |
   - [FIX] 兼容 `astrbot_plugin_cmdmask` 伪装指令，通过其 target extra 识别真实命令
 
   配置说明请查看插件配置页面。
-version: 3.4.2
+version: 3.4.3
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"
