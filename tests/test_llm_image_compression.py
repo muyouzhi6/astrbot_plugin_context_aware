@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import types
 import unittest
-import base64
 from pathlib import Path
 from unittest.mock import patch
 
@@ -293,9 +293,14 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 await plugin.terminate()
 
-            self.assertNotEqual(image_component.url, str(source))
-            self.assertTrue(Path(image_component.url).exists())
-            self.assertIn(image_component.url, event.tracked)
+            self.assertEqual(image_component.url, "")
+            self.assertNotEqual(image_component.path, str(source))
+            self.assertTrue(Path(image_component.path).exists())
+            self.assertEqual(image_component.file, Path(image_component.path).as_uri())
+            self.assertIn(
+                Path(image_component.path).resolve(),
+                [Path(path).resolve() for path in event.tracked],
+            )
 
     async def test_quoted_image_files_are_promoted_by_content(self):
         with tempfile.TemporaryDirectory() as root:
@@ -337,7 +342,9 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
                         promoted = reply_component.chain[0]
                         self.assertIsInstance(promoted, self.mod.Image)
-                        self.assertEqual(Path(promoted.path).resolve(), source.resolve())
+                        self.assertEqual(
+                            Path(promoted.path).resolve(), source.resolve()
+                        )
                         self.assertEqual(file_component.get_file_calls, 1)
             finally:
                 await plugin.terminate()
@@ -527,12 +534,115 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
             converted_ref = image_part["image_url"]["url"]
             self.assertNotEqual(converted_ref, data_uri)
-            self.assertTrue(converted_ref.endswith(".png"))
-            self.assertTrue(Path(converted_ref).exists())
+            self.assertTrue(converted_ref.startswith("data:image/png;base64,"))
+            converted_payload = base64.b64decode(converted_ref.partition(",")[2])
+            converted_path = Path(root) / "converted.png"
+            converted_path.write_bytes(converted_payload)
+            with Image.open(converted_path) as converted:
+                self.assertEqual(converted.format, "PNG")
+                self.assertEqual(getattr(converted, "n_frames", 1), 1)
             self.assertEqual(image_part["image_url"]["detail"], "high")
             self.assertEqual(untouched_part["image_url"], "not-a-readable-image")
-            self.assertIn(converted_ref, event.tracked)
+            self.assertEqual(len(event.tracked), 1)
             self.assertEqual(plugin._image_compress_count, 1)
+
+    async def test_history_small_data_uri_remains_self_contained(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "history.png"
+            image = Image.new("RGB", (32, 24), (12, 34, 56))
+            image.save(source, "PNG")
+            image.close()
+            data_uri = "data:image/png;base64," + base64.b64encode(
+                source.read_bytes()
+            ).decode("ascii")
+            plugin = self.mod.Main(
+                FakeContext(),
+                {
+                    "enable": False,
+                    "image_cache_dir": str(Path(root) / "cache"),
+                    "llm_image_compress": {
+                        "enable": True,
+                        "min_size_mb": 100,
+                        "max_edge": 2048,
+                    },
+                },
+            )
+            event = FakeCompressionEvent(private=True)
+            image_part = {
+                "type": "image_url",
+                "image_url": {"url": data_uri},
+            }
+            req = types.SimpleNamespace(
+                image_urls=[],
+                contexts=[{"role": "user", "content": [image_part]}],
+                extra_user_content_parts=[],
+            )
+
+            try:
+                await plugin._compress_provider_request_images(event, req)
+            finally:
+                await plugin.terminate()
+
+            prepared_ref = image_part["image_url"]["url"]
+            self.assertTrue(prepared_ref.startswith("data:image/png;base64,"))
+            self.assertEqual(
+                base64.b64decode(prepared_ref.partition(",")[2]),
+                source.read_bytes(),
+            )
+
+    async def test_stale_local_history_image_is_removed(self):
+        with tempfile.TemporaryDirectory() as root:
+            plugin = self.mod.Main(
+                FakeContext(),
+                {
+                    "enable": False,
+                    "image_cache_dir": str(Path(root) / "cache"),
+                    "llm_image_compress": {"enable": True},
+                },
+            )
+            stale_path = str(Path(root) / "cache" / "expired.gif")
+            text_part = {"type": "text", "text": "keep me"}
+            req = types.SimpleNamespace(
+                image_urls=[],
+                contexts=[
+                    {
+                        "role": "user",
+                        "content": [
+                            text_part,
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": stale_path},
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": f"base64:{stale_path}",
+                            },
+                        ],
+                    }
+                ],
+                extra_user_content_parts=[],
+            )
+
+            try:
+                await plugin._compress_provider_request_images(
+                    FakeCompressionEvent(private=True),
+                    req,
+                )
+            finally:
+                await plugin.terminate()
+
+            self.assertEqual(req.contexts[0]["content"], [text_part])
+
+    def test_component_local_reference_uses_file_uri_semantics(self):
+        with tempfile.TemporaryDirectory() as root:
+            local_path = str(Path(root) / "compressed.png")
+            component = types.SimpleNamespace(file="old", url="old", path="old")
+
+            self.mod.Main._replace_component_image_ref(component, local_path)
+
+            self.assertEqual(component.file, Path(local_path).resolve().as_uri())
+            self.assertEqual(component.url, "")
+            self.assertEqual(component.path, str(Path(local_path).resolve()))
 
     async def test_remote_download_retries_until_complete(self):
         with tempfile.TemporaryDirectory() as root:

@@ -12,6 +12,11 @@ help: |
   - Bot状态：上次发言时间
   - 图像转述：可选功能，将群友发送的图片转为文字描述
 
+  v3.4.4 更新：
+  - [FIX] 历史图片保持为自包含 data URI，不再持久化短期缓存路径
+  - [FIX] 自动移除已失效的历史本地图片引用，避免上游 Base64 解码失败
+  - [FIX] 规范化图片 file URI/path，避免同一图片被重复压缩
+
   v3.4.3 更新：
   - [FIX] LLM 请求图片预处理覆盖持久化历史 contexts，避免旧图片绕过压缩链
   - [FIX] GIF 提取首帧为 PNG 临时副本，兼容不支持 image/gif 的模型
@@ -99,7 +104,7 @@ help: |
   - [FIX] 兼容 `astrbot_plugin_cmdmask` 伪装指令，通过其 target extra 识别真实命令
 
   配置说明请查看插件配置页面。
-version: 3.4.3
+version: 3.4.4
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.24.0"

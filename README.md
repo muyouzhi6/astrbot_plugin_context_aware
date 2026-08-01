@@ -1,7 +1,10 @@
 # 上下文场景感知增强
 
-## v3.4.3
+## v3.4.4
 
+- 历史图片预处理后保持为自包含 `data URI`，不会把短期缓存路径写回持久化会话。
+- 自动移除会话中已经失效的本地图片引用，单张过期图片不再拖垮整轮 LLM 请求。
+- 图片组件使用正确的 `file URI`/本地 `path` 语义，并复用规范化路径避免重复压缩。
 - 持久化会话历史中的图片也会进入 LLM 请求图片预处理，不再只处理当前消息和引用消息。
 - GIF 会在单次 LLM 请求中提取首帧为 PNG 临时副本，兼容不支持 `image/gif` 的模型。
 - 引用消息中的图片文件会按真实内容归一化为 `Image`, 避免 Core 再次回查 OneBot。
@@ -167,7 +170,7 @@ provider_settings:
 
 **注意**：启用图像转述后，每张图片会调用一次 LLM，会产生额外费用和延迟。
 
-`show_recent_images_allow_gif` 只控制 `<recent_images>` 场景区块和图像转述，不会删除 AstrBot Core 已持久化的会话图片。启用 `llm_image_compress` 后，历史 GIF 会在发送给模型前转换为首帧 PNG 临时副本。
+`show_recent_images_allow_gif` 只控制 `<recent_images>` 场景区块和图像转述，不会删除 AstrBot Core 已持久化的会话图片。启用 `llm_image_compress` 后，历史 GIF 会在发送给模型前转换为首帧 PNG，并以自包含 `data URI` 进入本次请求；已经失效的历史本地图片引用会被安全移除，不影响同轮文本和其他图片。
 
 ### LLM 请求图片压缩
 

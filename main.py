@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.4.3 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.4.4 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,11 @@ AstrBot 上下文场景感知增强插件 v3.4.3 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.4.4 更新:
+- [FIX] 历史图片预处理结果保持为自包含 data URI，避免缓存过期后留下失效本地路径
+- [FIX] 自动移除已失效的历史本地图片引用，避免上游误按 Base64 解码并导致整轮请求失败
+- [FIX] 图片组件使用正确的 file URI/path 语义，并复用规范化路径避免重复压缩
 
 v3.4.3 更新:
 - [FIX] LLM 请求图片预处理覆盖持久化历史 contexts，避免旧图片绕过压缩链
@@ -61,7 +66,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.4.3
+Version: 3.4.4
 """
 
 from __future__ import annotations
@@ -81,6 +86,7 @@ import urllib.request
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, final
 
 from astrbot import logger
@@ -97,11 +103,13 @@ try:
         get_astrbot_temp_path,
     )
 except Exception:
+
     def get_astrbot_plugin_data_path() -> str:
         return os.path.join(os.getcwd(), "plugin_data")
 
     def get_astrbot_temp_path() -> str:
         return os.path.join(get_astrbot_plugin_data_path(), "temp")
+
 
 try:
     from .image_compression import (
@@ -126,7 +134,7 @@ if TYPE_CHECKING:
 @final
 class ExtraKeys:
     """框架 extra 字段键名常量，集中管理避免魔法字符串"""
-    
+
     POKE_TRIGGER: Final[str] = "_poke_trigger"
     POKE_SENDER_ID: Final[str] = "_poke_sender_id"
     POKE_SENDER_NAME: Final[str] = "_poke_sender_name"
@@ -150,7 +158,7 @@ class ExtraKeys:
     CMDMASK_TARGET: Final[str] = "__astrbot_plugin_cmdmask:target"
 
     IMAGE_COMPRESS_MAP: Final[str] = "_context_aware_image_compress_map"
-    
+
     # 场景注入标记，防止重复注入
     SCENE_INJECTED_MARKER: Final[str] = "<!-- context_aware_scene_v3 -->"
 
@@ -184,11 +192,31 @@ TRIGGER_NAMES: Final = {
 }
 
 # 回复特征词（用于判断是否在回复 Bot）- 可通过配置覆盖
-DEFAULT_REPLY_STARTERS: Final = frozenset({
-    "好的", "好", "嗯", "是的", "对", "谢谢", "感谢", "收到",
-    "明白", "知道了", "了解", "可以", "行", "没问题",
-    "ok", "OK", "Ok", "好滴", "好哒", "好嘞", "okok",
-})
+DEFAULT_REPLY_STARTERS: Final = frozenset(
+    {
+        "好的",
+        "好",
+        "嗯",
+        "是的",
+        "对",
+        "谢谢",
+        "感谢",
+        "收到",
+        "明白",
+        "知道了",
+        "了解",
+        "可以",
+        "行",
+        "没问题",
+        "ok",
+        "OK",
+        "Ok",
+        "好滴",
+        "好哒",
+        "好嘞",
+        "okok",
+    }
+)
 
 IMAGE_CACHE_CLEANUP_INTERVAL: Final = 60
 IMAGE_CACHE_PREFIX: Final = "context-aware-"
@@ -206,14 +234,16 @@ IMAGE_CACHE_FILENAME_RE = re.compile(
 @final
 class InferenceReason:
     """对话对象推断原因常量"""
-    
-    RULE_1_AT_BOT: Final[str] = "rule_1_at_bot"           # 明确 @Bot
-    RULE_2_AT_OTHER: Final[str] = "rule_2_at_other"       # @其他人
-    RULE_3_REPLY: Final[str] = "rule_3_reply"             # 引用回复
-    RULE_4_BOT_REPLIED: Final[str] = "rule_4_bot_replied" # Bot 刚回复过此人
-    RULE_4B_BOT_INTERRUPTED: Final[str] = "rule_4b_bot_interrupted" # Bot 插话导致误判，回退给上一位对话者
-    RULE_5_ABA_PATTERN: Final[str] = "rule_5_aba_pattern" # A-B-A 对话模式
-    DEFAULT_GROUP: Final[str] = "default_group"           # 默认群聊
+
+    RULE_1_AT_BOT: Final[str] = "rule_1_at_bot"  # 明确 @Bot
+    RULE_2_AT_OTHER: Final[str] = "rule_2_at_other"  # @其他人
+    RULE_3_REPLY: Final[str] = "rule_3_reply"  # 引用回复
+    RULE_4_BOT_REPLIED: Final[str] = "rule_4_bot_replied"  # Bot 刚回复过此人
+    RULE_4B_BOT_INTERRUPTED: Final[str] = (
+        "rule_4b_bot_interrupted"  # Bot 插话导致误判，回退给上一位对话者
+    )
+    RULE_5_ABA_PATTERN: Final[str] = "rule_5_aba_pattern"  # A-B-A 对话模式
+    DEFAULT_GROUP: Final[str] = "default_group"  # 默认群聊
 
 
 # ============================================================================
@@ -308,7 +338,9 @@ def _event_message_outline(event: AstrMessageEvent) -> str:
         except Exception:
             outline = ""
     if not outline:
-        outline = str(getattr(event.message_obj, "message_str", "") or event.message_str or "")
+        outline = str(
+            getattr(event.message_obj, "message_str", "") or event.message_str or ""
+        )
     return _clean_one_line(outline)
 
 
@@ -336,7 +368,10 @@ def _looks_like_voice_transcript(text: str) -> bool:
 def _looks_like_image_outline(text: str) -> bool:
     """识别平台概要中的图片占位，兼容不同适配器的文案。"""
     lowered = text.lower()
-    return any(token in lowered for token in ("[图片", "图片", "照片", "[image", "image", "photo"))
+    return any(
+        token in lowered
+        for token in ("[图片", "图片", "照片", "[image", "image", "photo")
+    )
 
 
 _GIF_BASE64_PREFIXES: Final[tuple[str, str]] = ("R0lGODlh", "R0lGODdh")
@@ -371,9 +406,9 @@ def _image_ref_looks_like_gif(image_ref: str) -> bool:
     payload = ref
     lowered_payload = payload.lower()
     if lowered_payload.startswith("base64://"):
-        payload = payload[len("base64://"):]
+        payload = payload[len("base64://") :]
     elif lowered_payload.startswith("base64:"):
-        payload = payload[len("base64:"):]
+        payload = payload[len("base64:") :]
 
     if payload.lower().startswith("data:") and "," in payload:
         payload = payload.split(",", 1)[1]
@@ -440,7 +475,9 @@ class SessionState:
     bot_last_replied_to: str = ""  # Bot 上次回复的对象 ID
     bot_last_replied_to_name: str = ""  # Bot 上次回复的对象名称
     # 关键锚点分离，不随消息淘汰
-    last_user_interaction: dict[str, float] = field(default_factory=dict)  # user_id -> timestamp
+    last_user_interaction: dict[str, float] = field(
+        default_factory=dict
+    )  # user_id -> timestamp
     # 会话摘要（用于上下文压缩）
     summary: str = ""
     summary_updated_at: float = 0.0
@@ -482,16 +519,16 @@ class SessionSnapshot:
 
 class SessionManager:
     """会话管理器 - 带 LRU 淘汰机制和异步锁保护
-    
+
     v3.0.0 重构:
     - 添加 asyncio.Lock 防止并发竞态
     - 使用 deque 自动裁剪，避免非原子操作
     - 淘汰会话时同时清理关联的锁
-    
+
     v3.0.1 增强:
     - 添加缓存级别锁保护 LRU 的 move_to_end/popitem
     - 废弃同步写方法的直接使用（保留向后兼容但加警告）
-    
+
     并发模型说明:
     - _cache_lock: 保护 _sessions (OrderedDict) 和 _locks (dict) 的结构性修改
     - 每会话锁: 保护单个会话的 messages/state 修改
@@ -520,7 +557,7 @@ class SessionManager:
 
     async def _get_or_create_session(self, session_id: str) -> SessionState:
         """获取或创建会话状态（异步，带缓存锁保护）
-        
+
         这是并发安全的核心方法，保护 LRU 的 move_to_end 和 popitem。
         """
         async with self._cache_lock:
@@ -541,7 +578,7 @@ class SessionManager:
 
     def get(self, session_id: str) -> SessionState:
         """获取或创建会话状态（同步方法，用于读取）
-        
+
         警告：此方法在并发场景下可能存在竞态。
         推荐在异步上下文中使用 _get_or_create_session()。
         """
@@ -616,7 +653,9 @@ class SessionManager:
             state.messages = deque(recent, maxlen=state.messages.maxlen)
             state.summary = summary
             state.summary_updated_at = updated_at
-            state.summary_message_count = max(state.summary_message_count, summarized_count)
+            state.summary_message_count = max(
+                state.summary_message_count, summarized_count
+            )
             state.compressing = False
 
     async def remove_session_async(self, session_id: str) -> int:
@@ -630,7 +669,7 @@ class SessionManager:
 
     def add_message(self, session_id: str, msg: MessageRecord) -> bool:
         """同步添加消息（向后兼容，但不推荐在并发场景使用）
-        
+
         注意：此方法不提供完整的并发保护，仅用于向后兼容。
         """
         state = self.get(session_id)
@@ -694,36 +733,36 @@ class SessionManager:
 
     async def remove_message_by_id_async(self, session_id: str, msg_id: str) -> bool:
         """异步删除指定消息（带锁保护）
-        
+
         供 recall_cancel 等插件调用，在消息撤回时清理记录。
         """
         async with self._get_lock(session_id):
             if session_id not in self._sessions:
                 return False
-            
+
             state = self._sessions[session_id]
             original_count = len(state.messages)
             new_messages: deque[MessageRecord] = deque(
                 (m for m in state.messages if m.msg_id != msg_id),
-                maxlen=state.messages.maxlen
+                maxlen=state.messages.maxlen,
             )
             state.messages = new_messages
-            
+
             return original_count - len(state.messages) > 0
 
     def remove_message_by_id(self, session_id: str, msg_id: str) -> bool:
         """同步删除指定消息（向后兼容）"""
         if session_id not in self._sessions:
             return False
-        
+
         state = self._sessions[session_id]
         original_count = len(state.messages)
         new_messages: deque[MessageRecord] = deque(
             (m for m in state.messages if m.msg_id != msg_id),
-            maxlen=state.messages.maxlen
+            maxlen=state.messages.maxlen,
         )
         state.messages = new_messages
-        
+
         return original_count - len(state.messages) > 0
 
     async def remove_last_bot_message_async(self, session_id: str) -> bool:
@@ -731,36 +770,36 @@ class SessionManager:
         async with self._get_lock(session_id):
             if session_id not in self._sessions:
                 return False
-            
+
             state = self._sessions[session_id]
             if not state.messages:
                 return False
-            
+
             messages_list = list(state.messages)
             for i in range(len(messages_list) - 1, -1, -1):
                 if messages_list[i].is_bot:
                     del messages_list[i]
                     state.messages = deque(messages_list, maxlen=state.messages.maxlen)
                     return True
-            
+
             return False
 
     def remove_last_bot_message(self, session_id: str) -> bool:
         """同步删除最后一条 Bot 消息（向后兼容）"""
         if session_id not in self._sessions:
             return False
-        
+
         state = self._sessions[session_id]
         if not state.messages:
             return False
-        
+
         messages_list = list(state.messages)
         for i in range(len(messages_list) - 1, -1, -1):
             if messages_list[i].is_bot:
                 del messages_list[i]
                 state.messages = deque(messages_list, maxlen=state.messages.maxlen)
                 return True
-        
+
         return False
 
 
@@ -771,7 +810,7 @@ class SessionManager:
 
 class SceneAnalyzer:
     """场景分析器 - 负责所有分析逻辑
-    
+
     v3.0.0: 添加 bot_id 只读属性，支持自定义回复特征词
     """
 
@@ -784,8 +823,8 @@ class SceneAnalyzer:
     )
 
     def __init__(
-        self, 
-        bot_id: str, 
+        self,
+        bot_id: str,
         bot_names: list[str] | None = None,
         reply_starters: frozenset[str] | None = None,
         wake_prefixes: list[str] | None = None,
@@ -798,11 +837,18 @@ class SceneAnalyzer:
         for n in names:
             if re.fullmatch(r"[a-z0-9_]+", n):
                 compiled.append(
-                    (n, re.compile(rf"(?<![\\w]){re.escape(n)}(?![\\w])", re.IGNORECASE))
+                    (
+                        n,
+                        re.compile(
+                            rf"(?<![\\w]){re.escape(n)}(?![\\w])", re.IGNORECASE
+                        ),
+                    )
                 )
             else:
                 compiled.append((n, None))
-        self._bot_name_patterns: tuple[tuple[str, re.Pattern[str] | None], ...] = tuple(compiled)
+        self._bot_name_patterns: tuple[tuple[str, re.Pattern[str] | None], ...] = tuple(
+            compiled
+        )
         self._reply_starters = reply_starters or DEFAULT_REPLY_STARTERS
         self._wake_prefixes: tuple[str, ...] = tuple(
             str(prefix).strip()
@@ -850,7 +896,9 @@ class SceneAnalyzer:
                     image_count += 1
                     if _image_ref_looks_like_gif(self._image_ref_from_component(comp)):
                         gif_count += 1
-        has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
+        has_image = image_count > 0 or (
+            not has_plain_text and _looks_like_image_outline(message_outline)
+        )
 
         msg = MessageRecord(
             msg_id=str(event.message_obj.message_id),
@@ -916,7 +964,10 @@ class SceneAnalyzer:
         # 检查是否为戳一戳触发（由 poke_to_llm 插件设置）
         if event.get_extra(ExtraKeys.POKE_TRIGGER):
             poke_sender_name = event.get_extra(ExtraKeys.POKE_SENDER_NAME) or sender
-            return TRIGGER_POKE, f"{poke_sender_name} 戳了戳你，可能想让你回应之前的内容或想和你聊天"
+            return (
+                TRIGGER_POKE,
+                f"{poke_sender_name} 戳了戳你，可能想让你回应之前的内容或想和你聊天",
+            )
 
         if event.is_private_chat():
             return TRIGGER_PRIVATE, f"私聊对话，{sender} 在直接和你交流"
@@ -949,12 +1000,19 @@ class SceneAnalyzer:
                     if name and name in msg_lower:
                         return TRIGGER_MENTION, f"{sender} 在消息中提到了你"
 
-        if event.get_extra(ExtraKeys.ACTIVE_TRIGGER) or event.get_extra(ExtraKeys.ACTIVE_REPLY_TRIGGERED):
+        if event.get_extra(ExtraKeys.ACTIVE_TRIGGER) or event.get_extra(
+            ExtraKeys.ACTIVE_REPLY_TRIGGERED
+        ):
             return TRIGGER_ACTIVE, "你是主动加入这个对话的，没有人在叫你"
 
         if event.is_at_or_wake_command:
             other_targets = _other_explicit_target_names(msg)
-            if other_targets and not msg.at_bot and not msg.at_all and msg.reply_to_id != self._bot_id:
+            if (
+                other_targets
+                and not msg.at_bot
+                and not msg.at_all
+                and msg.reply_to_id != self._bot_id
+            ):
                 return (
                     TRIGGER_ACTIVE,
                     f"{sender} 明确在和 {_format_name_list(other_targets)} 对话，你是被动卷入的",
@@ -977,12 +1035,12 @@ class SceneAnalyzer:
     ) -> str:
         """
         推断消息的对话对象
-        
+
         核心原则：宁可保守（判定为群聊），不可激进（误判为和Bot说话）
         只有高置信度时才判定 talking_to = "bot"
-        
+
         v3.0.0: 返回推断原因，用于可观测性
-        
+
         Returns:
             推断原因常量 (InferenceReason.*)
         """
@@ -991,9 +1049,10 @@ class SceneAnalyzer:
         # ===== 规则1: 明确的 @ Bot（高置信度）=====
         if msg.at_bot:
             msg.talking_to = "bot"
-            msg.talking_to_name = _format_name_list(
-                [target_name for _, target_name in explicit_targets]
-            ) or "你"
+            msg.talking_to_name = (
+                _format_name_list([target_name for _, target_name in explicit_targets])
+                or "你"
+            )
             return InferenceReason.RULE_1_AT_BOT
 
         # ===== 规则2: @ 其他人（高置信度）=====
@@ -1048,10 +1107,16 @@ class SceneAnalyzer:
             if bot_replied_to == msg.sender_id:
                 stripped = msg.content.strip()
                 # 保守：只对"短确认/致谢类"做推断，避免把用户对他人的"好的/嗯"等当成回复 Bot
-                if stripped and len(stripped) <= 20 and self._looks_like_reply(stripped):
+                if (
+                    stripped
+                    and len(stripped) <= 20
+                    and self._looks_like_reply(stripped)
+                ):
                     # v3.2.0: 若最近60s内有其他用户主动在和当前发言者说话，
                     # 则认为用户在回应那个人，而非 Bot
-                    history_list = list(history) if isinstance(history, deque) else history
+                    history_list = (
+                        list(history) if isinstance(history, deque) else history
+                    )
                     prev_to_user: MessageRecord | None = None
                     for m in reversed(history_list[:-1]):
                         if msg.timestamp - m.timestamp > 90:
@@ -1152,11 +1217,11 @@ class SceneGenerator:
         )
 
         parts.append(
-            f'  <current_message>'
-            f'\n    <sender>{esc(current.sender_name)}</sender>'
-            f'\n    <talking_to>{esc(addressee_desc)}</talking_to>'
-            f'\n    <content>{esc(current.content[:80])}</content>'
-            f'\n  </current_message>'
+            f"  <current_message>"
+            f"\n    <sender>{esc(current.sender_name)}</sender>"
+            f"\n    <talking_to>{esc(addressee_desc)}</talking_to>"
+            f"\n    <content>{esc(current.content[:80])}</content>"
+            f"\n  </current_message>"
         )
 
         # ===== 3. 关键行为指导（重点！）=====
@@ -1164,11 +1229,11 @@ class SceneGenerator:
             trigger_type, current, is_talking_to_bot, is_talking_to_group
         )
         if instruction:
-            parts.append(f'  <instruction>{instruction}</instruction>')
+            parts.append(f"  <instruction>{instruction}</instruction>")
 
         # ===== 4. 对话流（简化）=====
         if summary:
-            parts.append(f'  <history_summary>{esc(summary[:600])}</history_summary>')
+            parts.append(f"  <history_summary>{esc(summary[:600])}</history_summary>")
 
         if show_flow and len(flow) > 1:
             flow_lines: list[str] = []
@@ -1181,10 +1246,12 @@ class SceneGenerator:
                 )
                 sender = "[你]" if m.is_bot else m.sender_name
                 preview = m.content[:20] + ("..." if len(m.content) > 20 else "")
-                flow_lines.append(f'    <m>{esc(sender)} → {esc(to_name)}: {esc(preview)}</m>')
-            parts.append('  <recent_flow>')
+                flow_lines.append(
+                    f"    <m>{esc(sender)} → {esc(to_name)}: {esc(preview)}</m>"
+                )
+            parts.append("  <recent_flow>")
             parts.extend(flow_lines)
-            parts.append('  </recent_flow>')
+            parts.append("  </recent_flow>")
 
         if show_recent_images:
             image_lines: list[str] = []
@@ -1204,8 +1271,14 @@ class SceneGenerator:
                 )
                 sender = "[你]" if m.is_bot else m.sender_name
                 preview_source = content or m.message_outline or "[图片]"
-                preview = preview_source[:120] + ("..." if len(preview_source) > 120 else "")
-                display_count = visible_image_count if m.has_gif and not show_recent_gifs else m.image_count
+                preview = preview_source[:120] + (
+                    "..." if len(preview_source) > 120 else ""
+                )
+                display_count = (
+                    visible_image_count
+                    if m.has_gif and not show_recent_gifs
+                    else m.image_count
+                )
                 count_attr = f' count="{display_count}"' if display_count > 1 else ""
                 image_lines.append(
                     f'    <image sender="{esc(sender)}" talking_to="{esc(to_name)}"{count_attr}>'
@@ -1247,7 +1320,9 @@ class SceneGenerator:
 
         # ===== 6. 参与者 =====
         if len(participants) > 1:
-            parts.append(f'  <participants>{esc(", ".join(participants[:5]))}</participants>')
+            parts.append(
+                f"  <participants>{esc(', '.join(participants[:5]))}</participants>"
+            )
 
         parts.append("</conversation_scene>")
         return "\n".join(parts)
@@ -1261,7 +1336,7 @@ class SceneGenerator:
     ) -> str:
         """
         生成行为指导 - 这是解决"误以为在问自己"问题的关键
-        
+
         核心原则：
         - 明确触发（@、回复、唤醒词、私聊、戳一戳）→ 正常回应
         - 主动触发 → 必须明确告知 Bot 它是主动插入的
@@ -1278,7 +1353,13 @@ class SceneGenerator:
             )
 
         # ===== 被明确呼叫 - 正常回复 =====
-        if trigger in (TRIGGER_AT, TRIGGER_AT_ALL, TRIGGER_REPLY, TRIGGER_WAKE, TRIGGER_PRIVATE):
+        if trigger in (
+            TRIGGER_AT,
+            TRIGGER_AT_ALL,
+            TRIGGER_REPLY,
+            TRIGGER_WAKE,
+            TRIGGER_PRIVATE,
+        ):
             return "用户在和你对话，请正常回应。"
 
         # ===== 戳一戳触发 - 用户主动找你 =====
@@ -1327,13 +1408,13 @@ class SceneGenerator:
                     "【谨慎】触发原因不明确。虽然上下文分析显示用户可能在和你说话，"
                     "但请仔细判断这是否真的是对你说的。如果不确定，请保持沉默或简短回应。"
                 )
-            
+
             if is_talking_to_group:
                 return (
                     "【注意】触发原因不明确，这条消息是说给群里的。"
                     "在不确定的情况下，建议保持沉默或仅在有价值时简短补充。"
                 )
-            
+
             return (
                 f"【注意】触发原因不明确。{msg.sender_name} 似乎在和 {msg.talking_to_name} 对话。"
                 f"在不确定的情况下，建议保持沉默，避免误入他人对话。"
@@ -1375,7 +1456,9 @@ class Main(star.Star):
         self._group_only = self._cfg_bool("only_group_chat", True)
         self._warn_builtin_ltm = self._cfg_bool("warn_builtin_ltm", True)
         self._show_recent_images = self._cfg_bool("show_recent_images", True)
-        self._show_recent_images_allow_gif = self._cfg_bool("show_recent_images_allow_gif", False)
+        self._show_recent_images_allow_gif = self._cfg_bool(
+            "show_recent_images_allow_gif", False
+        )
         self._image_context_window = max(1, self._cfg_int("image_context_window", 20))
         self._voice_context_window = max(0, self._cfg_int("voice_context_window", 50))
         self._builtin_ltm_warned: set[str] = set()
@@ -1385,9 +1468,14 @@ class Main(star.Star):
         # 图像转述配置
         self._image_caption_enabled = self._cfg_bool("image_caption", False)
         self._image_caption_lazy = self._cfg_bool("image_caption_lazy", False)
-        self._image_caption_provider_id = str(self._cfg("image_caption_provider_id", "") or "")
+        self._image_caption_provider_id = str(
+            self._cfg("image_caption_provider_id", "") or ""
+        )
         self._image_caption_prompt = str(
-            self._cfg("image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。") or ""
+            self._cfg(
+                "image_caption_prompt", "请用中文简洁描述这张图片的内容，不超过50字。"
+            )
+            or ""
         )
         self._image_compress_options = ImageCompressionOptions.from_mapping(
             self._cfg("llm_image_compress", {})
@@ -1396,7 +1484,9 @@ class Main(star.Star):
 
         # v3.0.0: 图像转述并发控制
         self._image_caption_semaphore = asyncio.Semaphore(3)  # 最多并发3个
-        self._image_caption_cache: OrderedDict[str, tuple[str, float]] = OrderedDict()  # URL -> (caption, timestamp)
+        self._image_caption_cache: OrderedDict[str, tuple[str, float]] = (
+            OrderedDict()
+        )  # URL -> (caption, timestamp)
         self._image_caption_cache_max = 100  # 硬上限
         self._image_caption_cache_ttl = 3600.0  # 缓存1小时，与图片下载缓存 TTL 对齐
         # 图片本地缓存目录（lazy 模式提前下载用）
@@ -1411,7 +1501,9 @@ class Main(star.Star):
         try:
             os.makedirs(self._image_cache_dir, exist_ok=True)
         except Exception as e:
-            logger.warning(f"[ContextAware] 无法创建图片缓存目录 {self._image_cache_dir}: {e}")
+            logger.warning(
+                f"[ContextAware] 无法创建图片缓存目录 {self._image_cache_dir}: {e}"
+            )
             self._image_cache_dir = ""
         self._image_download_cache: dict[tuple[str, int], str] = {}
         self._image_download_failures: dict[tuple[str, int], float] = {}
@@ -1422,9 +1514,7 @@ class Main(star.Star):
             1, self._cfg_int("image_download_max_bytes", 50 * 1024 * 1024)
         )
         # 缓存文件保留时间（秒），默认 1 小时；启动时、后台任务和下载前都会清理过期文件
-        self._image_cache_ttl = max(
-            60, self._cfg_int("image_cache_ttl", 3600)
-        )
+        self._image_cache_ttl = max(60, self._cfg_int("image_cache_ttl", 3600))
         self._last_image_cache_cleanup = 0.0
         self._image_cache_cleanup_task: asyncio.Task | None = None
         self._cleanup_image_cache(force=True)
@@ -1459,13 +1549,11 @@ class Main(star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.4.3"
+        version = "3.4.4"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
-        compress_status = (
-            "已启用" if self._image_compress_options.enabled else "未启用"
-        )
+        compress_status = "已启用" if self._image_compress_options.enabled else "未启用"
         logger.info(
             f"[ContextAware] 插件 v{version} 已加载 | "
             f"图像转述: {caption_status} | LLM 图片压缩: {compress_status}"
@@ -1504,15 +1592,19 @@ class Main(star.Star):
     def _inject_scene(self, req: ProviderRequest, scene: str) -> None:
         """安全注入场景描述到请求（v3.0.0: 防止重复注入 + 兼容处理）"""
         marker = ExtraKeys.SCENE_INJECTED_MARKER
-        
+
         # 检查是否已注入（防止重复）
-        if hasattr(req, 'system_prompt') and req.system_prompt and marker in req.system_prompt:
+        if (
+            hasattr(req, "system_prompt")
+            and req.system_prompt
+            and marker in req.system_prompt
+        ):
             logger.debug("[ContextAware] 场景已注入，跳过重复注入")
             return
-        
+
         # 优先使用 extra_user_content_parts
         try:
-            extra_parts = getattr(req, 'extra_user_content_parts', None)
+            extra_parts = getattr(req, "extra_user_content_parts", None)
             if extra_parts is not None and isinstance(extra_parts, list):
                 part = TextPart(text=scene)
                 mark_as_temp = getattr(part, "mark_as_temp", None)
@@ -1524,7 +1616,7 @@ class Main(star.Star):
                 return
         except Exception:
             pass
-        
+
         # 回退方案：添加到 system_prompt（带标记）
         try:
             req.system_prompt = (req.system_prompt or "") + f"\n\n{marker}\n{scene}"
@@ -1628,11 +1720,13 @@ class Main(star.Star):
         custom_starters = self._cfg_list("reply_starters", None)
         reply_starters = frozenset(custom_starters) if custom_starters else None
         astrbot_config = self._context.get_config()
-        wake_prefixes_raw = astrbot_config.get("wake_prefix", []) if astrbot_config else []
+        wake_prefixes_raw = (
+            astrbot_config.get("wake_prefix", []) if astrbot_config else []
+        )
         wake_prefixes = [str(prefix) for prefix in wake_prefixes_raw if prefix]
 
         self._analyzer = SceneAnalyzer(
-            bot_id=self._bot_id, 
+            bot_id=self._bot_id,
             bot_names=bot_names,
             reply_starters=reply_starters,
             wake_prefixes=wake_prefixes,
@@ -1656,7 +1750,9 @@ class Main(star.Star):
             "instruction": str(self._cfg("history_compress_instruction", "") or ""),
             "timeout_sec": float(self._cfg_int("history_compress_timeout", 60)),
             "max_input_chars": self._cfg_int("history_compress_max_input_chars", 5000),
-            "max_summary_chars": self._cfg_int("history_compress_max_summary_chars", 800),
+            "max_summary_chars": self._cfg_int(
+                "history_compress_max_summary_chars", 800
+            ),
         }
 
     def _build_summary_input(self, msgs: list[MessageRecord], *, max_chars: int) -> str:
@@ -1679,18 +1775,25 @@ class Main(star.Star):
         # 输入过长时保留末尾（更贴近当前主题）
         return text[-max_chars:]
 
-    async def _maybe_compress_history(self, umo: str, snapshot: SessionSnapshot) -> SessionSnapshot:
+    async def _maybe_compress_history(
+        self, umo: str, snapshot: SessionSnapshot
+    ) -> SessionSnapshot:
         cfg = self._history_compress_cfg()
         if cfg["strategy"] != "llm_summary":
             return snapshot
 
         trigger_count = max(10, int(cfg["trigger_count"]))
         keep_recent = max(5, int(cfg["keep_recent"]))
-        if len(snapshot.messages) < trigger_count or len(snapshot.messages) <= keep_recent + 5:
+        if (
+            len(snapshot.messages) < trigger_count
+            or len(snapshot.messages) <= keep_recent + 5
+        ):
             return snapshot
 
         now = time.time()
-        if snapshot.summary_updated_at and (now - snapshot.summary_updated_at) < float(cfg["min_interval_sec"]):
+        if snapshot.summary_updated_at and (now - snapshot.summary_updated_at) < float(
+            cfg["min_interval_sec"]
+        ):
             return snapshot
 
         # 避免同一会话并发重复压缩
@@ -1730,7 +1833,9 @@ class Main(star.Star):
 
                 prompt_parts = []
                 if snapshot.summary:
-                    prompt_parts.append(f"已有摘要（可在此基础上更新）：\n{snapshot.summary}\n")
+                    prompt_parts.append(
+                        f"已有摘要（可在此基础上更新）：\n{snapshot.summary}\n"
+                    )
                 prompt_parts.append(f"需要压缩的历史：\n{input_text}\n")
                 prompt_parts.append("请输出新的摘要：")
                 prompt = "\n".join(prompt_parts)
@@ -1940,7 +2045,9 @@ class Main(star.Star):
                 self._image_cache_cleanup_loop()
             )
         except RuntimeError:
-            logger.debug("[ContextAware] 当前无运行中的事件循环，跳过图片缓存后台清理任务")
+            logger.debug(
+                "[ContextAware] 当前无运行中的事件循环，跳过图片缓存后台清理任务"
+            )
 
     async def _image_cache_cleanup_loop(self) -> None:
         """后台定期清理图片缓存，让 TTL 在长期运行时持续生效。"""
@@ -2024,9 +2131,7 @@ class Main(star.Star):
             self._image_download_failures.pop(cache_key, None)
 
         # 生成缓存文件名
-        url_hash = hashlib.md5(
-            f"{effective_limit}\0{image_url}".encode()
-        ).hexdigest()
+        url_hash = hashlib.md5(f"{effective_limit}\0{image_url}".encode()).hexdigest()
         ext = ".jpg"
         lower_url = image_url.lower()
         if ".png" in lower_url:
@@ -2109,6 +2214,7 @@ class Main(star.Star):
         timeout: int = 15,
     ) -> int | None:
         """同步下载远程图片；由 asyncio.to_thread 调用，避免阻塞事件循环。"""
+
         def cleanup_partial() -> None:
             try:
                 if os.path.exists(local_path):
@@ -2193,7 +2299,7 @@ class Main(star.Star):
 
     @staticmethod
     def _component_image_ref(component: Any) -> str:
-        for attr in ("url", "file", "path"):
+        for attr in ("url", "path", "file"):
             value = getattr(component, attr, "")
             if isinstance(value, str) and value:
                 return value
@@ -2201,12 +2307,32 @@ class Main(star.Star):
 
     @staticmethod
     def _replace_component_image_ref(component: Any, image_ref: str) -> None:
-        for attr in ("url", "file", "path"):
-            if hasattr(component, attr):
-                try:
-                    setattr(component, attr, image_ref)
-                except Exception:
-                    pass
+        if image_ref.startswith(("http://", "https://", "data:", "base64://")):
+            replacements = {
+                "file": image_ref,
+                "url": image_ref
+                if image_ref.startswith(("http://", "https://"))
+                else "",
+                "path": "",
+            }
+        else:
+            local_ref = image_ref
+            if image_ref.startswith("file://"):
+                local_ref = urllib.parse.unquote(image_ref.removeprefix("file://"))
+            local_path = Path(local_ref).resolve(strict=False)
+            replacements = {
+                "file": local_path.as_uri(),
+                "url": "",
+                "path": str(local_path),
+            }
+
+        for attr, value in replacements.items():
+            if not hasattr(component, attr):
+                continue
+            try:
+                setattr(component, attr, value)
+            except Exception:
+                pass
 
     @staticmethod
     def _detect_local_image_format(image_path: str) -> str | None:
@@ -2306,6 +2432,9 @@ class Main(star.Star):
             effective_ref = local_path if os.path.isfile(local_path) else image_ref
             mapping[image_ref] = effective_ref
             mapping[local_path] = effective_ref
+            resolved_local_path = Path(local_path).resolve(strict=False)
+            mapping[str(resolved_local_path)] = effective_ref
+            mapping[resolved_local_path.as_uri()] = effective_ref
             if outcome.reason.startswith("error:"):
                 self._image_compress_errors += 1
                 logger.warning(
@@ -2323,6 +2452,9 @@ class Main(star.Star):
         mapping[image_ref] = outcome.output_path
         mapping[local_path] = outcome.output_path
         mapping[outcome.output_path] = outcome.output_path
+        resolved_output_path = Path(outcome.output_path).resolve(strict=False)
+        mapping[str(resolved_output_path)] = outcome.output_path
+        mapping[resolved_output_path.as_uri()] = outcome.output_path
         self._image_compress_count += 1
         self._image_compress_saved_bytes += max(
             outcome.source_bytes - outcome.output_bytes,
@@ -2445,29 +2577,76 @@ class Main(star.Star):
                 content = context.get("content")
                 if not isinstance(content, list):
                     continue
+                prepared_content: list[Any] = []
                 for part in content:
                     if not isinstance(part, dict) or part.get("type") != "image_url":
+                        prepared_content.append(part)
                         continue
                     image_part = part.get("image_url")
                     if isinstance(image_part, dict):
                         image_ref = image_part.get("url")
                         if not isinstance(image_ref, str) or not image_ref:
+                            prepared_content.append(part)
                             continue
-                        compressed_ref = await self._compress_image_reference(
-                            event,
-                            image_ref,
-                        )
-                        if compressed_ref != image_ref:
-                            image_part["url"] = compressed_ref
-                            replacements[image_ref] = compressed_ref
                     elif isinstance(image_part, str) and image_part:
-                        compressed_ref = await self._compress_image_reference(
-                            event,
-                            image_part,
+                        image_ref = image_part
+                    else:
+                        prepared_content.append(part)
+                        continue
+
+                    source_ref = image_ref
+                    local_ref: str | None = None
+                    if image_ref.startswith("file://"):
+                        local_ref = urllib.parse.unquote(
+                            image_ref.removeprefix("file://")
                         )
-                        if compressed_ref != image_part:
-                            part["image_url"] = compressed_ref
-                            replacements[image_part] = compressed_ref
+                    elif image_ref.startswith("base64:") and not image_ref.startswith(
+                        "base64://"
+                    ):
+                        candidate = image_ref.removeprefix("base64:")
+                        if os.path.isabs(candidate) or re.match(
+                            r"^[A-Za-z]:[\\/]",
+                            candidate,
+                        ):
+                            local_ref = candidate
+                    elif os.path.isabs(image_ref) or re.match(
+                        r"^[A-Za-z]:[\\/]",
+                        image_ref,
+                    ):
+                        local_ref = image_ref
+
+                    if local_ref is not None and not os.path.isfile(local_ref):
+                        logger.warning(
+                            "[ContextAware] 移除已失效的历史图片引用: "
+                            f"{image_ref[:120]}"
+                        )
+                        continue
+
+                    compressed_ref = await self._compress_image_reference(
+                        event,
+                        local_ref or image_ref,
+                    )
+                    data_uri_source = compressed_ref
+                    if compressed_ref.startswith("file://"):
+                        data_uri_source = urllib.parse.unquote(
+                            compressed_ref.removeprefix("file://")
+                        )
+                    if os.path.isfile(data_uri_source):
+                        data_uri = self._local_path_to_data_uri(data_uri_source)
+                        if not data_uri:
+                            logger.warning(
+                                "[ContextAware] 移除无法持久化的历史图片引用: "
+                                f"{image_ref[:120]}"
+                            )
+                            continue
+                        compressed_ref = data_uri
+
+                    if isinstance(image_part, dict):
+                        image_part["url"] = compressed_ref
+                    else:
+                        part["image_url"] = compressed_ref
+                    prepared_content.append(part)
+                context["content"] = prepared_content
 
         if not replacements:
             return
@@ -2536,7 +2715,9 @@ class Main(star.Star):
                 # 获取 provider
                 provider = None
                 if self._image_caption_provider_id:
-                    provider = self._context.get_provider_by_id(self._image_caption_provider_id)
+                    provider = self._context.get_provider_by_id(
+                        self._image_caption_provider_id
+                    )
                     if not provider:
                         logger.warning(
                             f"[ContextAware] 找不到指定的图像转述提供商: {self._image_caption_provider_id}"
@@ -2546,7 +2727,9 @@ class Main(star.Star):
                     provider = self._context.get_using_provider()
 
                 if not provider or not isinstance(provider, Provider):
-                    logger.warning("[ContextAware] 无法获取有效的 Provider 进行图像转述")
+                    logger.warning(
+                        "[ContextAware] 无法获取有效的 Provider 进行图像转述"
+                    )
                     return None
 
                 # 调用 LLM 获取图片描述（带超时）
@@ -2556,12 +2739,14 @@ class Main(star.Star):
                             prompt=self._image_caption_prompt,
                             image_urls=[effective_url],
                         ),
-                        timeout=self._image_caption_timeout
+                        timeout=self._image_caption_timeout,
                     )
                 except asyncio.TimeoutError:
                     elapsed = time.perf_counter() - t0
                     self._image_caption_errors += 1
-                    logger.warning(f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s, 耗时 {elapsed:.1f}s)")
+                    logger.warning(
+                        f"[ContextAware] 图像转述超时 ({self._image_caption_timeout}s, 耗时 {elapsed:.1f}s)"
+                    )
                     self._mark_url_failed(cache_key)  # 防重试
                     return None
 
@@ -2575,9 +2760,13 @@ class Main(star.Star):
                     # 缓存结果（使用 OrderedDict 实现 LRU）
                     self._image_caption_cache[cache_key] = (caption, time.time())
                     # LRU 淘汰：超过硬上限时移除最旧的
-                    while len(self._image_caption_cache) > self._image_caption_cache_max:
+                    while (
+                        len(self._image_caption_cache) > self._image_caption_cache_max
+                    ):
                         self._image_caption_cache.popitem(last=False)
-                    logger.info(f"[ContextAware] 图像转述完成 ({elapsed:.1f}s) | {caption[:40]}...")
+                    logger.info(
+                        f"[ContextAware] 图像转述完成 ({elapsed:.1f}s) | {caption[:40]}..."
+                    )
                     return caption
 
                 # LLM返回空响应（如图片被核心静默丢弃等），标记失败
@@ -2598,7 +2787,11 @@ class Main(star.Star):
         self, messages: list[MessageRecord]
     ) -> list[MessageRecord]:
         """延迟图像转述：对 image_flow 中尚未描述的图片进行转述（在 LLM 请求时触发）"""
-        if not self._image_caption_enabled or not self._image_caption_lazy or not messages:
+        if (
+            not self._image_caption_enabled
+            or not self._image_caption_lazy
+            or not messages
+        ):
             return messages
 
         updated: list[MessageRecord] = []
@@ -2632,32 +2825,38 @@ class Main(star.Star):
                     # 按顺序替换，每次替换第一个 [图片] 标记
                     idx = new_content.find("[图片]", caption_index)
                     if idx >= 0:
-                        new_content = new_content[:idx] + f"[图片: {caption}]" + new_content[idx + 4:]
+                        new_content = (
+                            new_content[:idx]
+                            + f"[图片: {caption}]"
+                            + new_content[idx + 4 :]
+                        )
                         caption_index = idx + len(f"[图片: {caption}]")
                     else:
                         new_content += f" | [图片: {caption}]"
             if new_content != msg.content:
-                updated.append(MessageRecord(
-                    msg_id=msg.msg_id,
-                    sender_id=msg.sender_id,
-                    sender_name=msg.sender_name,
-                    content=new_content[:500],
-                    timestamp=msg.timestamp,
-                    is_bot=msg.is_bot,
-                    at_bot=msg.at_bot,
-                    at_all=msg.at_all,
-                    reply_to_id=msg.reply_to_id,
-                    talking_to=msg.talking_to,
-                    talking_to_name=msg.talking_to_name,
-                    at_targets=list(msg.at_targets),
-                    message_outline=msg.message_outline,
-                    has_image=msg.has_image,
-                    image_count=msg.image_count,
-                    has_gif=msg.has_gif,
-                    gif_count=msg.gif_count,
-                    image_urls=list(msg.image_urls),
-                    image_local_paths=list(msg.image_local_paths),
-                ))
+                updated.append(
+                    MessageRecord(
+                        msg_id=msg.msg_id,
+                        sender_id=msg.sender_id,
+                        sender_name=msg.sender_name,
+                        content=new_content[:500],
+                        timestamp=msg.timestamp,
+                        is_bot=msg.is_bot,
+                        at_bot=msg.at_bot,
+                        at_all=msg.at_all,
+                        reply_to_id=msg.reply_to_id,
+                        talking_to=msg.talking_to,
+                        talking_to_name=msg.talking_to_name,
+                        at_targets=list(msg.at_targets),
+                        message_outline=msg.message_outline,
+                        has_image=msg.has_image,
+                        image_count=msg.image_count,
+                        has_gif=msg.has_gif,
+                        gif_count=msg.gif_count,
+                        image_urls=list(msg.image_urls),
+                        image_local_paths=list(msg.image_local_paths),
+                    )
+                )
             else:
                 updated.append(msg)
         return updated
@@ -2696,8 +2895,10 @@ class Main(star.Star):
                 if is_gif:
                     gif_count += 1
                 # 尝试图像转述（非 lazy 模式才在消息到达时描述）
-                if self._image_caption_enabled and not self._image_caption_lazy and (
-                    not is_gif or self._show_recent_images_allow_gif
+                if (
+                    self._image_caption_enabled
+                    and not self._image_caption_lazy
+                    and (not is_gif or self._show_recent_images_allow_gif)
                 ):
                     if image_url:
                         caption = await self._get_image_caption(image_url)
@@ -2723,7 +2924,9 @@ class Main(star.Star):
                         collected_local_paths.append("")  # placeholder
                     parts.append("[图片]")
 
-        has_image = image_count > 0 or (not has_plain_text and _looks_like_image_outline(message_outline))
+        has_image = image_count > 0 or (
+            not has_plain_text and _looks_like_image_outline(message_outline)
+        )
         content = "".join(parts) if parts else (message_outline or "[消息]")
         if has_image and image_count == 0 and "[图片" not in content:
             content = f"[图片] {content}".strip()
@@ -2749,7 +2952,9 @@ class Main(star.Star):
             if isinstance(comp, At):
                 qq_str = str(comp.qq)
                 msg.at_targets.append(
-                    _normalize_at_target(self._analyzer.bot_id, qq_str, comp.name or qq_str)
+                    _normalize_at_target(
+                        self._analyzer.bot_id, qq_str, comp.name or qq_str
+                    )
                 )
                 if qq_str == self._analyzer.bot_id:
                     msg.at_bot = True
@@ -2766,7 +2971,9 @@ class Main(star.Star):
     # -------------------------------------------------------------------------
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.ALL)
-    async def on_message(self, event: AstrMessageEvent, *args: Any, **kwargs: Any) -> None:
+    async def on_message(
+        self, event: AstrMessageEvent, *args: Any, **kwargs: Any
+    ) -> None:
         """监听所有消息，记录到历史"""
         try:
             await self._prepare_event_images_for_llm(event)
@@ -2879,11 +3086,17 @@ class Main(star.Star):
 
             # 检查是否为戳一戳触发
             is_poke_trigger = bool(event.get_extra(ExtraKeys.POKE_TRIGGER))
-            
+
             if is_poke_trigger:
                 # 戳一戳触发时，创建虚拟的 current 消息表示戳一戳用户
-                poke_sender_id = event.get_extra(ExtraKeys.POKE_SENDER_ID) or event.get_sender_id()
-                poke_sender_name = event.get_extra(ExtraKeys.POKE_SENDER_NAME) or event.get_sender_name() or poke_sender_id
+                poke_sender_id = (
+                    event.get_extra(ExtraKeys.POKE_SENDER_ID) or event.get_sender_id()
+                )
+                poke_sender_name = (
+                    event.get_extra(ExtraKeys.POKE_SENDER_NAME)
+                    or event.get_sender_name()
+                    or poke_sender_id
+                )
                 current = MessageRecord(
                     msg_id=f"poke_{uuid.uuid4().hex[:12]}",
                     sender_id=str(poke_sender_id),
@@ -2896,7 +3109,9 @@ class Main(star.Star):
                 )
                 flow_source = snapshot.messages
             else:
-                current_from_extra = event.get_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, None)
+                current_from_extra = event.get_extra(
+                    ExtraKeys.CURRENT_MESSAGE_RECORD, None
+                )
                 current = (
                     current_from_extra
                     if isinstance(current_from_extra, MessageRecord)
@@ -2907,14 +3122,18 @@ class Main(star.Star):
                 flow_source = snapshot.messages
                 try:
                     idx = next(
-                        (i for i, m in enumerate(flow_source) if m.msg_id == current.msg_id),
+                        (
+                            i
+                            for i, m in enumerate(flow_source)
+                            if m.msg_id == current.msg_id
+                        ),
                         -1,
                     )
                     if idx >= 0:
                         flow_source = flow_source[: idx + 1]
                 except Exception:
                     pass
-                
+
             # 可选：压缩历史（会裁剪 flow_source 对应的底层会话）
             snapshot2 = await self._maybe_compress_history(umo, snapshot)
             if snapshot2 is not snapshot:
@@ -2923,7 +3142,11 @@ class Main(star.Star):
                 if not is_poke_trigger:
                     try:
                         idx2 = next(
-                            (i for i, m in enumerate(flow_source) if m.msg_id == current.msg_id),
+                            (
+                                i
+                                for i, m in enumerate(flow_source)
+                                if m.msg_id == current.msg_id
+                            ),
                             -1,
                         )
                         if idx2 >= 0:
@@ -2946,12 +3169,12 @@ class Main(star.Star):
             window = self._cfg_int("dialogue_window", 8)
             flow = flow_source[-window:] if window > 0 else flow_source
             image_flow = (
-                flow_source[-self._image_context_window:]
+                flow_source[-self._image_context_window :]
                 if self._image_context_window > 0
                 else flow_source
             )
             voice_flow = (
-                flow_source[-self._voice_context_window:]
+                flow_source[-self._voice_context_window :]
                 if self._voice_context_window > 0
                 else []
             )
@@ -3017,9 +3240,7 @@ class Main(star.Star):
             logger.error(f"[ContextAware] 场景分析失败: {e}")
 
     @filter.on_llm_response()
-    async def on_llm_response(
-        self, event: AstrMessageEvent, resp: LLMResponse
-    ) -> None:
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse) -> None:
         """记录 Bot 回复"""
         if not self._should_process(event):
             return
@@ -3032,7 +3253,7 @@ class Main(star.Star):
 
         now = time.time()
         umo = event.unified_msg_origin
-        
+
         # 获取当前消息的发送者（Bot 正在回复的人）
         sender_id = event.get_sender_id()
         sender_name = event.get_sender_name() or sender_id
@@ -3186,7 +3407,9 @@ class Main(star.Star):
 
         供 recall_cancel 等插件调用，在消息撤回时清理记录。
         """
-        result = await self._sessions.remove_message_by_id_async(unified_msg_origin, msg_id)
+        result = await self._sessions.remove_message_by_id_async(
+            unified_msg_origin, msg_id
+        )
         if result:
             logger.debug(f"[ContextAware] 已删除消息记录 msg_id={msg_id}")
         return result
