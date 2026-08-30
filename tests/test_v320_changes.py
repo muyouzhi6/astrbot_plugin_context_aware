@@ -7,8 +7,10 @@ v3.2.0 新改动的单元测试
 3. 规则6 已移除（快速连续对话不再推断对话对象）
 4. strict_mode：TRIGGER_ACTIVE/UNKNOWN 下强制 talking_to=group
 """
+
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import time
@@ -24,6 +26,7 @@ PLUGIN_PATH = Path(__file__).resolve().parents[1] / "main.py"
 def _decorator(*args: Any, **kwargs: Any):
     def wrap(func):
         return func
+
     return wrap
 
 
@@ -38,10 +41,17 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
     agent_message_mod = types.ModuleType("astrbot.core.agent.message")
 
     class Logger:
-        def info(self, *a, **kw): pass
-        def debug(self, *a, **kw): pass
-        def warning(self, *a, **kw): pass
-        def error(self, *a, **kw): pass
+        def info(self, *a, **kw):
+            pass
+
+        def debug(self, *a, **kw):
+            pass
+
+        def warning(self, *a, **kw):
+            pass
+
+        def error(self, *a, **kw):
+            pass
 
     class Star:
         def __init__(self, context):
@@ -63,6 +73,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
     class TextPart:
         def __init__(self, text: str):
             self.text = text
+
         def mark_as_temp(self):
             return self
 
@@ -83,8 +94,9 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
             self.qq = qq
             self.name = name
 
-    class AtAll:
-        pass
+    class AtAll(At):
+        def __init__(self):
+            super().__init__(qq="all", name="全体成员")
 
     class Reply:
         def __init__(self, sender_id: str = ""):
@@ -124,12 +136,18 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
 
 def load_plugin_module():
     with patch.dict(sys.modules, install_astrbot_stubs()):
-        spec = importlib.util.spec_from_file_location("context_aware_v320", PLUGIN_PATH)
+        package_name = "context_aware_v320"
+        package = types.ModuleType(package_name)
+        package.__path__ = [str(PLUGIN_PATH.parent)]
+        sys.modules[package_name] = package
+        module_name = f"{package_name}.main"
+        spec = importlib.util.spec_from_file_location(module_name, PLUGIN_PATH)
         module = importlib.util.module_from_spec(spec)
         assert spec and spec.loader
-        sys.modules["context_aware_v320"] = module
+        sys.modules[module_name] = module
         spec.loader.exec_module(module)
-        sys.modules.pop("context_aware_v320", None)
+        sys.modules.pop(module_name, None)
+        sys.modules.pop(package_name, None)
         return module
 
 
@@ -145,9 +163,18 @@ class V320ChangesTest(unittest.TestCase):
     def _make_analyzer(self, bot_id: str = "bot"):
         return self.mod.SceneAnalyzer(bot_id=bot_id)
 
-    def _make_msg(self, msg_id, sender_id, sender_name, content, ts,
-                  is_bot=False, talking_to="group", talking_to_name="群聊",
-                  at_bot=False):
+    def _make_msg(
+        self,
+        msg_id,
+        sender_id,
+        sender_name,
+        content,
+        ts,
+        is_bot=False,
+        talking_to="group",
+        talking_to_name="群聊",
+        at_bot=False,
+    ):
         msg = self.mod.MessageRecord(
             msg_id=msg_id,
             sender_id=sender_id,
@@ -170,8 +197,16 @@ class V320ChangesTest(unittest.TestCase):
         analyzer = self._make_analyzer()
         now = time.time()
 
-        bot_msg = self._make_msg("b1", "bot", "[你]", "好的，稍等。", now - 15,
-                                  is_bot=True, talking_to="alice", talking_to_name="Alice")
+        bot_msg = self._make_msg(
+            "b1",
+            "bot",
+            "[你]",
+            "好的，稍等。",
+            now - 15,
+            is_bot=True,
+            talking_to="alice",
+            talking_to_name="Alice",
+        )
         user_msg = self._make_msg("u2", "alice", "Alice", "谢谢", now)
 
         reason = analyzer.infer_addressee(
@@ -180,15 +215,27 @@ class V320ChangesTest(unittest.TestCase):
             bot_replied_to="alice",
             bot_replied_to_name="Alice",
         )
-        self.assertEqual(user_msg.talking_to, "bot", f"应推断为bot，得到: {user_msg.talking_to} ({reason})")
+        self.assertEqual(
+            user_msg.talking_to,
+            "bot",
+            f"应推断为bot，得到: {user_msg.talking_to} ({reason})",
+        )
 
     def test_rule4_beyond_20s_does_not_infer_bot(self):
         """规则4收紧：Bot回复后25秒，时间窗口已过，不再推断为回复Bot"""
         analyzer = self._make_analyzer()
         now = time.time()
 
-        bot_msg = self._make_msg("b1", "bot", "[你]", "好的，稍等。", now - 25,
-                                  is_bot=True, talking_to="alice", talking_to_name="Alice")
+        bot_msg = self._make_msg(
+            "b1",
+            "bot",
+            "[你]",
+            "好的，稍等。",
+            now - 25,
+            is_bot=True,
+            talking_to="alice",
+            talking_to_name="Alice",
+        )
         user_msg = self._make_msg("u2", "alice", "Alice", "谢谢", now)
 
         reason = analyzer.infer_addressee(
@@ -197,7 +244,11 @@ class V320ChangesTest(unittest.TestCase):
             bot_replied_to="alice",
             bot_replied_to_name="Alice",
         )
-        self.assertEqual(user_msg.talking_to, "group", f"25s后应保持group，得到: {user_msg.talking_to} ({reason})")
+        self.assertEqual(
+            user_msg.talking_to,
+            "group",
+            f"25s后应保持group，得到: {user_msg.talking_to} ({reason})",
+        )
 
     def test_rule4_other_user_talking_to_current_user_prevents_bot_inference(self):
         """规则4保护：最近有人主动在和当前用户说话，'谢谢'应推断为回那个人"""
@@ -205,11 +256,26 @@ class V320ChangesTest(unittest.TestCase):
         now = time.time()
 
         # Bob 10秒前对 Alice 说了话
-        bob_msg = self._make_msg("bob1", "bob", "Bob", "Alice你觉得呢", now - 10,
-                                  talking_to="alice", talking_to_name="Alice")
+        bob_msg = self._make_msg(
+            "bob1",
+            "bob",
+            "Bob",
+            "Alice你觉得呢",
+            now - 10,
+            talking_to="alice",
+            talking_to_name="Alice",
+        )
         # Bot 5秒前回复了 Alice
-        bot_msg = self._make_msg("b1", "bot", "[你]", "是的，Alice说得对。", now - 5,
-                                  is_bot=True, talking_to="alice", talking_to_name="Alice")
+        bot_msg = self._make_msg(
+            "b1",
+            "bot",
+            "[你]",
+            "是的，Alice说得对。",
+            now - 5,
+            is_bot=True,
+            talking_to="alice",
+            talking_to_name="Alice",
+        )
         # Alice 现在说"好的"
         user_msg = self._make_msg("u2", "alice", "Alice", "好的", now)
 
@@ -220,10 +286,16 @@ class V320ChangesTest(unittest.TestCase):
             bot_replied_to_name="Alice",
         )
         # 应该推断 Alice 在回复 Bob，不是 Bot
-        self.assertNotEqual(user_msg.talking_to, "bot",
-                            f"Bob刚对Alice说话，'好的'应回Bob而非Bot，得到: {user_msg.talking_to} ({reason})")
-        self.assertEqual(user_msg.talking_to, "bob",
-                          f"应推断为回复Bob，得到: {user_msg.talking_to} ({reason})")
+        self.assertNotEqual(
+            user_msg.talking_to,
+            "bot",
+            f"Bob刚对Alice说话，'好的'应回Bob而非Bot，得到: {user_msg.talking_to} ({reason})",
+        )
+        self.assertEqual(
+            user_msg.talking_to,
+            "bob",
+            f"应推断为回复Bob，得到: {user_msg.talking_to} ({reason})",
+        )
 
     # ------------------------------------------------------------------ #
     # 规则6：已移除，快速连续对话不应改变 talking_to
@@ -234,16 +306,29 @@ class V320ChangesTest(unittest.TestCase):
         analyzer = self._make_analyzer()
         now = time.time()
 
-        b_msg = self._make_msg("b1", "bob", "Bob", "今天天气真好", now - 8,
-                                talking_to="group", talking_to_name="群聊")
+        b_msg = self._make_msg(
+            "b1",
+            "bob",
+            "Bob",
+            "今天天气真好",
+            now - 8,
+            talking_to="group",
+            talking_to_name="群聊",
+        )
         a_msg = self._make_msg("a1", "alice", "Alice", "对啊", now)
 
         reason = analyzer.infer_addressee(a_msg, [b_msg])
         # 规则6 移除后，应保持默认 group
-        self.assertEqual(a_msg.talking_to, "group",
-                          f"规则6移除后应保持group，得到: {a_msg.talking_to} ({reason})")
-        self.assertEqual(reason, self.mod.InferenceReason.DEFAULT_GROUP,
-                          f"应为DEFAULT_GROUP，得到: {reason}")
+        self.assertEqual(
+            a_msg.talking_to,
+            "group",
+            f"规则6移除后应保持group，得到: {a_msg.talking_to} ({reason})",
+        )
+        self.assertEqual(
+            reason,
+            self.mod.InferenceReason.DEFAULT_GROUP,
+            f"应为DEFAULT_GROUP，得到: {reason}",
+        )
 
     # ------------------------------------------------------------------ #
     # strict_mode 测试
@@ -313,17 +398,111 @@ class V320ChangesTest(unittest.TestCase):
         """InferenceReason 不再包含 RULE_6_QUICK_FOLLOW"""
         self.assertFalse(
             hasattr(self.mod.InferenceReason, "RULE_6_QUICK_FOLLOW"),
-            "RULE_6_QUICK_FOLLOW 已从 v3.2.0 中移除"
+            "RULE_6_QUICK_FOLLOW 已从 v3.2.0 中移除",
         )
+
+    def test_extract_message_recognizes_aiocqhttp_at_all(self):
+        analyzer = self._make_analyzer()
+
+        class FakeMessageObj:
+            message_id = "m1"
+
+        class FakeEvent:
+            message_obj = FakeMessageObj()
+            message_str = "公告"
+
+            def get_sender_id(self):
+                return "alice"
+
+            def get_sender_name(self):
+                return "Alice"
+
+            def get_messages(self):
+                return [self.mod.At(qq="all", name="全体成员")]
+
+        event = FakeEvent()
+        event.mod = self.mod
+        message = analyzer.extract_message(event)
+
+        self.assertTrue(message.at_all)
+
+    def test_extract_message_checks_at_all_before_at(self):
+        analyzer = self._make_analyzer()
+
+        class FakeMessageObj:
+            message_id = "m2"
+
+        class FakeEvent:
+            message_obj = FakeMessageObj()
+            message_str = "公告"
+
+            def get_sender_id(self):
+                return "alice"
+
+            def get_sender_name(self):
+                return "Alice"
+
+            def get_messages(self):
+                return [self.mod.AtAll()]
+
+        event = FakeEvent()
+        event.mod = self.mod
+
+        self.assertTrue(analyzer.extract_message(event).at_all)
+
+    def test_runtime_caption_extractor_treats_qq_all_as_at_all_trigger(self):
+        analyzer = self._make_analyzer()
+        plugin = object.__new__(self.mod.Main)
+        plugin._analyzer = analyzer
+        plugin._image_caption_enabled = False
+        plugin._image_caption_lazy = False
+        plugin._show_recent_images_allow_gif = False
+
+        class FakeMessageObj:
+            message_id = "m3"
+
+        class FakeEvent:
+            message_obj = FakeMessageObj()
+            message_str = "公告"
+            is_at_or_wake_command = True
+
+            def get_sender_id(self):
+                return "alice"
+
+            def get_sender_name(self):
+                return "Alice"
+
+            def get_extra(self, key, default=None):
+                return default
+
+            def get_messages(self):
+                return [self.mod.At(qq="all", name="全体成员")]
+
+            def get_message_outline(self):
+                return "公告"
+
+            def is_private_chat(self):
+                return False
+
+        event = FakeEvent()
+        event.mod = self.mod
+        message = asyncio.run(plugin._extract_message_with_caption(event))
+
+        self.assertTrue(message.at_all)
+        trigger, _ = analyzer.detect_trigger(event, message)
+        self.assertEqual(trigger, self.mod.TRIGGER_AT_ALL)
 
     def test_version_is_340(self):
         """插件版本应为 3.4.x"""
         import re
+
         with open(PLUGIN_PATH, encoding="utf-8") as f:
             content = f.read()
-        match = re.search(r'^Version:\s*(\S+)', content, re.MULTILINE)
+        match = re.search(r"^Version:\s*(\S+)", content, re.MULTILINE)
         self.assertIsNotNone(match, "找不到 Version 字段")
-        self.assertTrue(match.group(1).startswith("3.4."), f"期望 3.4.x，实际: {match.group(1)}")
+        self.assertTrue(
+            match.group(1).startswith("3.4."), f"期望 3.4.x，实际: {match.group(1)}"
+        )
 
 
 if __name__ == "__main__":

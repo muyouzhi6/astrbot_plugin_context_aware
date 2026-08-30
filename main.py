@@ -915,15 +915,17 @@ class SceneAnalyzer:
         )
 
         for comp in event.get_messages():
-            if isinstance(comp, At):
+            if isinstance(comp, AtAll):
+                msg.at_all = True
+            elif isinstance(comp, At):
                 qq_str = str(comp.qq)
                 msg.at_targets.append(
                     _normalize_at_target(self._bot_id, qq_str, comp.name or qq_str)
                 )
                 if qq_str == self._bot_id:
                     msg.at_bot = True
-            elif isinstance(comp, AtAll):
-                msg.at_all = True
+                elif qq_str == "all":
+                    msg.at_all = True
             elif isinstance(comp, Reply):
                 if comp.sender_id:
                     msg.reply_to_id = str(comp.sender_id)
@@ -2949,7 +2951,9 @@ class Main(star.Star):
 
         # 提取 @ 和回复信息
         for comp in event.get_messages():
-            if isinstance(comp, At):
+            if isinstance(comp, AtAll):
+                msg.at_all = True
+            elif isinstance(comp, At):
                 qq_str = str(comp.qq)
                 msg.at_targets.append(
                     _normalize_at_target(
@@ -2958,8 +2962,8 @@ class Main(star.Star):
                 )
                 if qq_str == self._analyzer.bot_id:
                     msg.at_bot = True
-            elif isinstance(comp, AtAll):
-                msg.at_all = True
+                elif qq_str == "all":
+                    msg.at_all = True
             elif isinstance(comp, Reply):
                 if comp.sender_id:
                     msg.reply_to_id = str(comp.sender_id)
