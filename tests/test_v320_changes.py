@@ -493,8 +493,8 @@ class V320ChangesTest(unittest.TestCase):
         trigger, _ = analyzer.detect_trigger(event, message)
         self.assertEqual(trigger, self.mod.TRIGGER_AT_ALL)
 
-    def test_version_is_351(self):
-        """插件版本应为 3.5.x"""
+    def test_version_is_360(self):
+        """插件版本应为 3.6.x"""
         import re
 
         with open(PLUGIN_PATH, encoding="utf-8") as f:
@@ -502,7 +502,7 @@ class V320ChangesTest(unittest.TestCase):
         match = re.search(r"^Version:\s*(\S+)", content, re.MULTILINE)
         self.assertIsNotNone(match, "找不到 Version 字段")
         self.assertTrue(
-            match.group(1) == "3.5.1", f"期望 3.5.1，实际: {match.group(1)}"
+            match.group(1) == "3.6.0", f"期望 3.6.0，实际: {match.group(1)}"
         )
 
 

@@ -13,7 +13,7 @@ import socket
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -39,6 +39,11 @@ class ImageEntry:
     sequence: int
     ordinal: int
     count: int
+    kind: str = "message"
+    task_id: str = ""
+    request_sequence: int = 0
+    conversation_id: str = ""
+    parent_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -153,7 +158,21 @@ class ImageIndex:
             self.sessions.move_to_end(session)
             ids.append(entry.image_id)
             while len(self.sessions.get(session, [])) > self.per_session:
-                self._remove(self.sessions[session][0])
+                # Evict from the most represented sender first. A burst from
+                # one member should not evict every other member's last image.
+                session_ids = self.sessions[session]
+                counts = {}
+                for i in session_ids:
+                    owner = self.resources[i].entry.sender_id
+                    counts[owner] = counts.get(owner, 0) + 1
+                owner = max(counts, key=counts.get)
+                self._remove(
+                    next(
+                        i
+                        for i in session_ids
+                        if self.resources[i].entry.sender_id == owner
+                    )
+                )
         while len(self.sessions) > self.max_sessions:
             self.clear(next(iter(self.sessions)))
         self.prune()
@@ -166,6 +185,48 @@ class ImageIndex:
             for i in self.sessions.get(session, [])
             if self.resources[i].entry.sequence < before_sequence
         )
+
+    def add_generated(
+        self,
+        message,
+        session,
+        sequence,
+        data,
+        *,
+        task_id,
+        request_sequence,
+        conversation_id,
+        parent_ids,
+    ):
+        for image_id in self.sessions.get(session, []):
+            previous = self.resources[image_id]
+            entry = previous.entry
+            if entry.message_id == message.msg_id:
+                same = (
+                    previous.data == data
+                    and entry.kind == "generated"
+                    and entry.sender_id == message.sender_id
+                    and entry.task_id == task_id
+                    and entry.request_sequence == request_sequence
+                    and entry.conversation_id == conversation_id
+                    and entry.parent_ids == tuple(parent_ids)
+                )
+                return image_id if same else None
+        ids = self.add(session, message, sequence)
+        if not ids:
+            return None
+        resource = self.resources[ids[0]]
+        resource.data, resource.source = data, ""
+        resource.entry = replace(
+            resource.entry,
+            kind="generated",
+            task_id=task_id,
+            request_sequence=request_sequence,
+            conversation_id=conversation_id,
+            parent_ids=tuple(parent_ids),
+        )
+        self.prune()
+        return ids[0] if ids[0] in self.resources else None
 
     def get(self, session, image_id):
         self.prune()
@@ -255,7 +316,8 @@ class ImageIndex:
             )
             return None
 
-    async def read(self, session, image_id, detail="auto"):
+    async def read_bytes(self, session, image_id):
+        """Return retained input bytes, never a resized vision preview."""
         resource = self.get(session, image_id)
         if not resource:
             return None
@@ -272,9 +334,16 @@ class ImageIndex:
                 return None
         if self.get(session, image_id) is not resource or not resource.data:
             return None
+        return resource.data
+
+    async def read(self, session, image_id, detail="auto"):
+        data = await self.read_bytes(session, image_id)
+        resource = self.get(session, image_id)
+        if data is None or resource is None:
+            return None
         try:
             async with self.semaphore:
-                result = await asyncio.to_thread(encode_image, resource.data, detail)
+                result = await asyncio.to_thread(encode_image, data, detail)
         except Exception:
             return None
         return result if self.get(session, image_id) is resource else None
