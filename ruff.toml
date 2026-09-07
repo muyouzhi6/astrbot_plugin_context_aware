@@ -1,0 +1,6 @@
+# Keep local and CI validation identical, independent of user-level config.
+target-version = "py310"
+line-length = 88
+
+[lint]
+select = ["E4", "E7", "E9", "F"]
