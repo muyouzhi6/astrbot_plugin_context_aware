@@ -167,6 +167,50 @@
       }
     }
   },
+  "image_recall": {
+    "description": "启用上下文按需看图",
+    "type": "bool",
+    "default": true,
+    "hint": "记录未唤醒消息中的图片；模型可按需查看原图，不需要开启图像转述。需要视觉和工具能力。"
+  },
+  "image_recall_auto": {
+    "description": "明确提问时自动带入近期单图",
+    "type": "bool",
+    "default": true,
+    "hint": "同发送者 90 秒内唯一图片且明确问图时直接带入；有当前图、引用、多图或歧义时不自动猜测。"
+  },
+  "image_recall_ttl": {
+    "description": "图片回看保留时间（秒）",
+    "type": "int",
+    "default": 1800,
+    "min": 60,
+    "max": 86400,
+    "hint": "短期内存索引和图片缓存；重启、reset/new 后清空。"
+  },
+  "image_recall_per_session": {
+    "description": "每会话最多保留图片数",
+    "type": "int",
+    "default": 20,
+    "min": 1,
+    "max": 100,
+    "hint": "独立于普通文字消息窗口，繁忙群插话不会立即挤掉图片。"
+  },
+  "image_recall_memory_mb": {
+    "description": "按需看图缓存预算（MB）",
+    "type": "int",
+    "default": 64,
+    "min": 8,
+    "max": 256,
+    "hint": "所有会话共用的图片数据与来源缓存预算；解码工作内存另计，下载与处理并发为 2。"
+  },
+  "image_recall_max_per_request": {
+    "description": "每轮最多查看不同图片数",
+    "type": "int",
+    "default": 2,
+    "min": 1,
+    "max": 4,
+    "hint": "自动带入和工具查看合并计数；同图允许从 auto 升级 high 一次。"
+  },
   "image_caption": {
     "description": "启用图像转述（将群友发的图片转为文字描述）",
     "type": "bool",
@@ -249,8 +293,14 @@
     "description": "群聊历史压缩策略（可选）",
     "type": "string",
     "default": "off",
-    "options": ["off", "llm_summary"],
-    "labels": ["关闭", "LLM 摘要压缩"],
+    "options": [
+      "off",
+      "llm_summary"
+    ],
+    "labels": [
+      "关闭",
+      "LLM 摘要压缩"
+    ],
     "hint": "开启后会额外调用一次 LLM 来生成摘要，用于降低上下文膨胀与误判风险。"
   },
   "history_compress_trigger_count": {

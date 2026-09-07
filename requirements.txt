@@ -1,1 +1,3 @@
 Pillow>=10.0
+aiohttp>=3.9
+mcp>=1.0

@@ -62,6 +62,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
         on_llm_request=_decorator,
         on_llm_response=_decorator,
         after_message_sent=_decorator,
+        llm_tool=_decorator,
     )
 
     class TextPart:
