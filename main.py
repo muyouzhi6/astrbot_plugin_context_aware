@@ -3101,7 +3101,7 @@ class Main(star.Star):
                 self._image_index.read(event.unified_msg_origin, selected.image_id),
                 timeout=2,
             )
-        except TimeoutError:
+        except asyncio.TimeoutError:
             return
         if (
             payload is None

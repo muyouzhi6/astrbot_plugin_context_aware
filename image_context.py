@@ -209,7 +209,7 @@ class ImageIndex:
                     asyncio.shield(task) if task else self._load(image_id),
                     timeout=remaining,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 logging.getLogger(__name__).warning(
                     "[ContextAware] Local image retention exceeded event time budget"
                 )
@@ -268,7 +268,7 @@ class ImageIndex:
             # A cancelled caller must not cancel a shared background fetch.
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=12)
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 return None
         if self.get(session, image_id) is not resource or not resource.data:
             return None
