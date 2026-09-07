@@ -21,6 +21,12 @@ from astrbot.core.agent.tool import ToolSet  # noqa: E402
 from astrbot.core.agent.tool_image_cache import tool_image_cache  # noqa: E402
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest  # noqa: E402
 from astrbot.core.star.register.star_handler import llm_tools  # noqa: E402
+from astrbot.api.message_components import Image as ImageComponent  # noqa: E402
+from astrbot.core.platform.astr_message_event import AstrMessageEvent  # noqa: E402
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember  # noqa: E402
+from astrbot.core.platform.message_type import MessageType  # noqa: E402
+from astrbot.core.platform.platform_metadata import PlatformMetadata  # noqa: E402
+from astrbot.core.pipeline.preprocess_stage.stage import PreProcessStage  # noqa: E402
 
 from image_context import SEEN_KEY, SNAPSHOT_KEY, TOOL_NAME, strip_tool_images  # noqa: E402
 from main import Main, MessageRecord, TRIGGER_AT  # noqa: E402
@@ -47,9 +53,64 @@ async def verify():
         provider = SimpleNamespace(
             provider_config={"id": "test", "modalities": ["text", "image", "tool_use"]}
         )
-        context = SimpleNamespace(get_using_provider=lambda **kw: provider)
+        context = SimpleNamespace(
+            get_using_provider=lambda **kw: provider,
+            get_config=lambda **kw: {"wake_prefix": []},
+        )
         plugin = Main(context, {"image_cache_dir": temporary})
         try:
+            # Exercise Core preprocessing and the real event-finally cleanup.
+            # The old background-only capture returned zero images here.
+            for compressed in (False, True):
+                raw = AstrBotMessage()
+                raw.type = MessageType.GROUP_MESSAGE
+                raw.self_id = "bot"
+                raw.sender = MessageMember("a", "Alice")
+                raw.message_id = f"lifecycle_{compressed}"
+                raw.group_id = f"lifecycle_{compressed}"
+                buffer = io.BytesIO()
+                Image.new("RGB", (1024, 768), "blue").save(buffer, format="PNG")
+                raw.message = [
+                    ImageComponent(
+                        file="base64://" + base64.b64encode(buffer.getvalue()).decode()
+                    )
+                ]
+                raw.message_str = ""
+                raw.raw_message = {}
+                ev = AstrMessageEvent(
+                    "", raw, PlatformMetadata("aiocqhttp", "test", "test"), raw.group_id
+                )
+                stage = PreProcessStage()
+                stage.config = {}
+                stage.platform_settings = {}
+                stage.stt_settings = {}
+                await stage.process(ev)
+                owned = list(ev._temporary_local_files)
+                assert owned, "Core must own the normalized image files"
+                from image_compression import ImageCompressionOptions
+
+                plugin._image_compress_options = ImageCompressionOptions.from_mapping(
+                    {
+                        "enable": compressed,
+                        "max_edge": 512,
+                    }
+                )
+                before_compressions = plugin._image_compress_count
+                await plugin.on_message(ev)
+                assert (
+                    plugin._image_compress_count > before_compressions
+                ) == compressed
+                owned = list(ev._temporary_local_files)
+                ids = tuple(plugin._image_index.sessions[ev.unified_msg_origin])
+                ev.cleanup_temporary_local_files()
+                assert all(not Path(p).exists() for p in owned)
+                ev.set_extra(SNAPSHOT_KEY, ids)
+                result = await plugin.context_aware_view_images(ev, list(ids))
+                assert sum(p.type == "image" for p in result.content) == 1
+                print(
+                    f"PASS Core preprocess + immediate event cleanup + recall (compression={compressed})"
+                )
+            plugin._image_compress_options = ImageCompressionOptions.from_mapping({})
             event = Event()
             source_event = Event()
             plugin._stamp_image_event(source_event)
@@ -68,7 +129,7 @@ async def verify():
                     + base64.b64encode(buffer.getvalue()).decode()
                 ],
             )
-            plugin._record_recall_images(source_event, source)
+            await plugin._record_recall_images(source_event, source)
             question = MessageRecord(
                 msg_id="q",
                 sender_id="a",

@@ -12,6 +12,11 @@ help: |
   - Bot状态：上次发言时间
   - 图像转述：可选功能，将群友发送的图片转为文字描述
 
+  v3.5.1 修复：
+  - 修复真实群聊先发图后提问时，Core 清理消息临时文件导致工具返回 0 张图的问题
+  - 本地图片在事件结束前接管到有界内存缓存；远程下载仍在后台，接管总等待最多 3 秒
+  - 增加图片加载失败类型日志和真实 Core 事件清理回归测试
+
   v3.5.0 更新：
   - [FEAT] 群聊先发图、后明确提问时自动带入近期唯一单图
   - [FEAT] context_aware_view_images 按需查看本会话图片，可升级清晰度
@@ -111,7 +116,7 @@ help: |
   - [FIX] 兼容 `astrbot_plugin_cmdmask` 伪装指令，通过其 target extra 识别真实命令
 
   配置说明请查看插件配置页面。
-version: 3.5.0
+version: 3.5.1
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.26.8"

@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -157,6 +159,67 @@ class IndexTests(unittest.IsolatedAsyncioTestCase):
         for n in range(30):
             self.index.prefetch(self.index.add("g1", message(str(n)), n))
         self.assertLessEqual(len(self.index.tasks), 16)
+
+    async def test_local_capture_survives_immediate_event_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "event.png"
+            path.write_bytes(png())
+            msg = message()
+            msg.image_urls = [str(path)]
+            ids = self.index.add("g1", msg, 1)
+            await self.index.retain_local(ids)
+            path.unlink()
+            self.assertTrue(self.index.resources[ids[0]].data)
+            self.assertEqual(self.index.resources[ids[0]].source, "")
+            self.assertIsNotNone(await self.index.read("g1", ids[0]))
+
+    async def test_local_retention_does_not_download_remote_sources(self):
+        msg = message()
+        msg.image_urls = ["https://example.com/image.png"]
+        ids = self.index.add("g1", msg, 1)
+        self.index._fetch = AsyncMock(return_value=png())
+        await self.index.retain_local(ids)
+        self.index._fetch.assert_not_awaited()
+
+    async def test_reset_during_local_capture_does_not_resurrect(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch(source):
+            entered.set()
+            await release.wait()
+            return png()
+
+        self.index._fetch = fetch
+        msg = message()
+        msg.image_urls = ["/event/temporary.png"]
+        ids = self.index.add("g1", msg, 1)
+        retain = asyncio.create_task(self.index.retain_local(ids))
+        await entered.wait()
+        self.index.clear("g1")
+        release.set()
+        await retain
+        self.assertFalse(self.index.resources)
+
+    async def test_local_retention_has_total_deadline_and_preserves_shared_task(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def fetch(source):
+            entered.set()
+            await release.wait()
+            return png()
+
+        self.index.LOCAL_RETAIN_TIMEOUT = 0.01
+        self.index._fetch = fetch
+        msg = message()
+        msg.image_urls = ["/event/temporary.png"]
+        ids = self.index.add("g1", msg, 1)
+        self.index.prefetch(ids)
+        await entered.wait()
+        task = self.index.tasks[ids[0]]
+        await asyncio.wait_for(self.index.retain_local(ids), timeout=0.5)
+        self.assertFalse(task.cancelled())
+        release.set()
+        self.assertIsNotNone(await self.index.read("g1", ids[0]))
 
     async def test_private_network_and_oversized_invalid_sources_fail(self):
         for source in (
@@ -351,7 +414,7 @@ class PluginToolTests(unittest.IsolatedAsyncioTestCase):
         old_event = FakeEvent()
         self.plugin._stamp_image_event(old_event)
         await self.plugin._clear_session_context(old_event, "test")
-        self.plugin._record_recall_images(old_event, message("late"))
+        await self.plugin._record_recall_images(old_event, message("late"))
         self.assertFalse(self.plugin._image_index.resources)
 
 

@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.5.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.5.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.5.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.5.1 更新:
+- [FIX] 消息结束前接管 Core 预处理的本地临时图片，避免先发图后提问时文件已被清理
+- [TEST] 覆盖真实 Core 图片预处理、事件清理与后续看图的完整生命周期
 
 v3.5.0 更新:
 - [FEAT] 独立短期图片索引、明确近图自动带入和按需多模态看图工具
@@ -71,7 +75,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.5.0
+Version: 3.5.1
 """
 
 from __future__ import annotations
@@ -1598,7 +1602,7 @@ class Main(star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.5.0"
+        version = "3.5.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -3033,7 +3037,7 @@ class Main(star.Star):
             )
         return sequence
 
-    def _record_recall_images(
+    async def _record_recall_images(
         self, event: AstrMessageEvent, msg: MessageRecord
     ) -> None:
         self._stamp_image_event(event)
@@ -3046,6 +3050,7 @@ class Main(star.Star):
                 self._stamp_image_event(event),
                 allow_gif=self._show_recent_images_allow_gif,
             )
+            await self._image_index.retain_local(ids)
             self._image_index.prefetch(ids)
 
     def _recall_supports_vision(self, event: AstrMessageEvent) -> bool:
@@ -3253,7 +3258,7 @@ class Main(star.Star):
 
         # 使用支持图像转述的方法提取消息
         msg = await self._extract_message_with_caption(event)
-        self._record_recall_images(event, msg)
+        await self._record_recall_images(event, msg)
         snapshot = await self._sessions.get_snapshot_async(event.unified_msg_origin)
         inference_reason = self._analyzer.infer_addressee(
             msg,
@@ -3329,7 +3334,7 @@ class Main(star.Star):
         ):
             # 使用支持图像转述的方法
             msg = await self._extract_message_with_caption(event)
-            self._record_recall_images(event, msg)
+            await self._record_recall_images(event, msg)
             event.set_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, msg)
             added = await self._sessions.add_message_async(umo, msg)
             if added:

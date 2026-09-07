@@ -7,6 +7,7 @@ import base64
 import io
 import ipaddress
 import json
+import logging
 import re
 import socket
 import time
@@ -58,6 +59,8 @@ class ImageIndex:
     Snapshots contain IDs only. Eviction/reset invalidates in-flight lookups;
     completed downloads must recheck identity before publishing their bytes.
     """
+
+    LOCAL_RETAIN_TIMEOUT = 3.0
 
     def __init__(
         self,
@@ -181,6 +184,37 @@ class ImageIndex:
             ):
                 self._start(image_id)
 
+    async def retain_local(self, image_ids):
+        """Own local bytes before the caller's message lifecycle can delete them.
+
+        Core preprocess replaces adapter URLs with event-owned local files.
+        Unlike remote URLs, these must not be deferred to background prefetch.
+        Awaiting thread I/O keeps the event alive without blocking its loop.
+        """
+        deadline = asyncio.get_running_loop().time() + self.LOCAL_RETAIN_TIMEOUT
+        for image_id in image_ids:
+            resource = self.resources.get(image_id)
+            if not resource or resource.data:
+                continue
+            if resource.source.startswith(
+                ("http://", "https://", "data:", "base64://")
+            ):
+                continue
+            task = self.tasks.get(image_id)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task) if task else self._load(image_id),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                logging.getLogger(__name__).warning(
+                    "[ContextAware] Local image retention exceeded event time budget"
+                )
+                return
+
     def _start(self, image_id):
         task = asyncio.create_task(self._load(image_id))
         self.tasks[image_id] = task
@@ -205,8 +239,20 @@ class ImageIndex:
             return data if image_id in self.resources else None
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             resource.retry_at = time.time() + 15
+            # Do not expose signed URLs, filesystem paths or image data in logs.
+            source_kind = (
+                "remote"
+                if resource.source.startswith(("http://", "https://"))
+                else "local_or_inline"
+            )
+            logging.getLogger(__name__).warning(
+                "[ContextAware] Recall image load failed: id=%s source=%s error=%s",
+                image_id,
+                source_kind,
+                type(exc).__name__,
+            )
             return None
 
     async def read(self, session, image_id, detail="auto"):
