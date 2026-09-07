@@ -209,7 +209,7 @@ provider_settings:
 
 **注意**：启用图像转述后，每张图片会调用一次 LLM，会产生额外费用和延迟。
 
-`show_recent_images_allow_gif` 只控制 `<recent_images>` 场景区块和图像转述，不会删除 AstrBot Core 已持久化的会话图片。启用 `llm_image_compress` 后，历史 GIF 会在发送给模型前转换为首帧 PNG，并以自包含 `data URI` 进入本次请求；已经失效的历史本地图片引用会被安全移除，不影响同轮文本和其他图片。
+`show_recent_images_allow_gif` 控制 `<recent_images>` 场景区块、图像转述及按需看图索引中的 GIF，不会删除 AstrBot Core 已持久化的会话图片。启用 `llm_image_compress` 后，历史 GIF 会在发送给模型前转换为首帧 PNG，并以自包含 `data URI` 进入本次请求；已经失效的历史本地图片引用会被安全移除，不影响同轮文本和其他图片。
 
 ### LLM 请求图片压缩
 
