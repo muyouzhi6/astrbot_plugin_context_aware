@@ -60,6 +60,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
         PlatformAdapterType=PlatformAdapterType,
         platform_adapter_type=_decorator,
         on_llm_request=_decorator,
+        command=_decorator,
         on_llm_response=_decorator,
         after_message_sent=_decorator,
         llm_tool=_decorator,

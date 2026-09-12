@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.6.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.7.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,13 @@ AstrBot 上下文场景感知增强插件 v3.6.0 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.7.1 更新:
+- [FEAT] 私聊短期记忆命令查看最近请求实际注入快照，支持重载恢复
+- [PRIVACY] 注入正文日志默认关闭，会话隔离及过期请求凭据校验
+
+v3.7.0 更新:
+- [FEAT] 可选私聊话题笔记，后台增量摘要、预算控制及 SQLite 持久化
 
 v3.6.0 更新:
 - [FEAT] 版本化图片引用接口供 Gitee 编辑和混合参考自拍使用
@@ -80,7 +87,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.6.0
+Version: 3.7.1
 """
 
 from __future__ import annotations
@@ -166,6 +173,11 @@ try:
     from .image_reference_api import ImageReferenceAPI
 except ImportError:
     from image_reference_api import ImageReferenceAPI
+
+try:
+    from .private_topic import PART_PREFIX, RECEIPT, Settings, TopicMemory
+except ImportError:
+    from private_topic import PART_PREFIX, RECEIPT, Settings, TopicMemory
 
 if TYPE_CHECKING:
     from astrbot.core.config import AstrBotConfig
@@ -1244,6 +1256,7 @@ class SceneGenerator:
         show_recent_gifs: bool = True,
         image_flow: list[MessageRecord] | None = None,
         voice_flow: list[MessageRecord] | None = None,
+        private_chat: bool = False,
     ) -> str:
         """生成场景描述，重点强调对话对象"""
         esc = self._escape
@@ -1284,7 +1297,9 @@ class SceneGenerator:
 
         if show_flow and len(flow) > 1:
             flow_lines: list[str] = []
-            for m in flow[-5:]:
+            flow_limit = 12 if private_chat else 5
+            preview_limit = 120 if private_chat else 20
+            for m in flow[-flow_limit:]:
                 to_name = _describe_addressee(
                     m,
                     bot_label="你",
@@ -1292,7 +1307,9 @@ class SceneGenerator:
                     multi_target_bot_label="你",
                 )
                 sender = "[你]" if m.is_bot else m.sender_name
-                preview = m.content[:20] + ("..." if len(m.content) > 20 else "")
+                preview = m.content[:preview_limit] + (
+                    "..." if len(m.content) > preview_limit else ""
+                )
                 flow_lines.append(
                     f"    <m>{esc(sender)} → {esc(to_name)}: {esc(preview)}</m>"
                 )
@@ -1498,6 +1515,22 @@ class Main(ImageReferenceAPI, star.Star):
         super().__init__(context)
         self._config = config
         self._context = context  # 保存 context 用于获取 provider
+        self._topic_settings = Settings.parse(self._cfg("private_topic", {}))
+        self._topic = (
+            TopicMemory(
+                Path(get_astrbot_plugin_data_path())
+                / "astrbot_plugin_context_aware"
+                / "private_topics.sqlite3",
+                self._topic_settings,
+                self._topic_candidates,
+                self._topic_generate,
+                lambda action, detail: logger.info(
+                    f"[ContextAware Topic] {action}: {detail}"
+                ),
+            )
+            if self._topic_settings.enabled and self._cfg_bool("enable", True)
+            else None
+        )
 
         self._enabled = self._cfg_bool("enable", True)
         self._group_only = self._cfg_bool("only_group_chat", True)
@@ -1611,7 +1644,7 @@ class Main(ImageReferenceAPI, star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.6.0"
+        version = "3.7.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -1619,6 +1652,7 @@ class Main(ImageReferenceAPI, star.Star):
         logger.info(
             f"[ContextAware] 插件 v{version} 已加载 | "
             f"图像转述: {caption_status} | LLM 图片压缩: {compress_status}"
+            f" | 私聊话题记忆: {'已启用' if self._topic else '未启用'}"
         )
 
     def _cfg(self, key: str, default: Any = None) -> Any:
@@ -1689,9 +1723,173 @@ class Main(ImageReferenceAPI, star.Star):
         """判断是否应该处理此事件"""
         if not self._enabled:
             return False
-        if self._group_only and event.is_private_chat():
+        if event.is_private_chat() and not self._cfg_bool(
+            "enable_private_chat", not self._group_only
+        ):
             return False
         return True
+
+    async def _topic_candidates(self, umo: str) -> list[str]:
+        if self._topic_settings.provider_mode == "custom":
+            primary = self._topic_settings.provider_id
+            if not primary:
+                return []
+            candidates = [primary, *self._topic_settings.fallback_provider_ids]
+        else:
+            primary = await self._context.get_current_chat_provider_id(umo=umo)
+            cfg = self._context.get_config(umo=umo)
+            fallbacks = cfg.get("provider_settings", {}).get("fallback_chat_models", [])
+            candidates = [primary, *(fallbacks if isinstance(fallbacks, list) else [])]
+        return [
+            x
+            for x in candidates
+            if isinstance(x, str)
+            and x
+            and isinstance(self._context.get_provider_by_id(x), Provider)
+        ]
+
+    async def _topic_generate(self, provider_id, prompt, instruction):
+        # Use the existing provider credentials, with no tools or shared conversation.
+        return await self._context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=prompt,
+            system_prompt=instruction,
+            request_max_retries=1,
+        )
+
+    async def _topic_request(self, event, req):
+        if self._is_topic_inspect(event):
+            return
+        if (
+            not self._topic
+            or getattr(self, "_topic_faulted", False)
+            or not event.is_private_chat()
+        ):
+            return
+        cid = getattr(getattr(req, "conversation", None), "cid", None)
+        if not cid:
+            return  # Never fall back to a cross-conversation UMO-only key.
+        try:
+            receipt = event.get_extra(RECEIPT)
+            scope = (event.unified_msg_origin, str(cid))
+            if event.get_extra("_context_aware_topic_scope") != scope:
+                receipt = None
+            if receipt is None:
+                # Dashboard resets can clear history without emitting a chat command.
+                history = getattr(req.conversation, "history", None)
+                if history is not None and (history == "[]" or history == []):
+                    await self._topic.clear(event.unified_msg_origin, str(cid))
+                raw = (
+                    _event_voice_transcript(event)
+                    or event.get_message_str()
+                    or "[非文本消息，未解析其内容]"
+                )
+                event_id = str(
+                    getattr(event.message_obj, "message_id", "") or uuid.uuid4().hex
+                )
+                receipt = await self._topic.begin(
+                    event.unified_msg_origin, str(cid), event_id, raw
+                )
+                event.set_extra(RECEIPT, receipt)
+                event.set_extra("_context_aware_topic_scope", scope)
+            text = await self._topic.render(receipt, getattr(req, "contexts", []))
+            parts = req.extra_user_content_parts
+            # Idempotent on repeat hooks, independent from image scene injections.
+            parts[:] = [
+                p
+                for p in parts
+                if not (isinstance(p, TextPart) and p.text.startswith(PART_PREFIX))
+            ]
+            if text:
+                parts.append(TextPart(text=text).mark_as_temp())
+                logger.info(f"[ContextAware Topic] injected chars={len(text)}")
+            await self._topic.save_injection(receipt, text)
+            if self._cfg("private_topic", {}).get("log_injected_content") is True:
+                record = json.dumps(
+                    {
+                        "session": event.unified_msg_origin,
+                        "conversation_id": str(cid),
+                        "turn_id": receipt[2],
+                        "content": text,
+                    },
+                    ensure_ascii=False,
+                )
+                if event.get_extra("_context_aware_topic_logged") != record:
+                    logger.info(f"[ContextAware Topic] injection_snapshot={record}")
+                    event.set_extra("_context_aware_topic_logged", record)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[ContextAware Topic] request bypass: {type(exc).__name__}")
+
+    @staticmethod
+    def _is_topic_inspect(event):
+        return str(event.get_message_str() or "").strip() in {"短期记忆", "/短期记忆"}
+
+    @filter.command("短期记忆", priority=100)
+    async def show_short_term_memory(self, event: AstrMessageEvent):
+        """查看当前私聊会话最近一次请求实际注入的话题资料，不调用模型。"""
+        event.stop_event()
+        if not event.is_private_chat():
+            yield event.plain_result(
+                "请在私聊中使用“短期记忆”，仅可查看当前私聊会话的注入内容。"
+            )
+            return
+        if not self._topic:
+            yield event.plain_result("私聊话题摘要未启用，当前没有可查看的注入记录。")
+            return
+        try:
+            manager = self._context.conversation_manager
+            umo = event.unified_msg_origin
+            cid = await manager.get_curr_conversation_id(umo)
+            conversation = await manager.get_conversation(umo, cid) if cid else None
+            if not conversation or getattr(conversation, "history", "[]") in ("[]", []):
+                result = None
+            else:
+                result = await self._topic.last_injection(umo, str(cid))
+            if result is None:
+                text = "当前会话暂无注入记录。正常对话产生上下文补充后，可再次使用“短期记忆”查看。"
+            elif not result["text"]:
+                text = "当前会话最近一次请求未注入话题资料。可能尚未形成摘要，或近期原文已包含在聊天历史中。"
+            else:
+                stamp = time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(result["created"])
+                )
+                text = f"短期记忆｜最近一次请求的实际注入内容\n记录时间：{stamp}（服务器时间）\n后台后续更新的摘要不影响此记录。\n\n{result['text']}"
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[ContextAware Topic] inspect failed: {type(exc).__name__}")
+            text = "暂时无法读取短期记忆，请稍后重试。"
+        # Bound each platform message without shortening the stored snapshot.
+        for start in range(0, len(text), 1500):
+            yield event.plain_result(text[start : start + 1500])
+
+    async def _topic_reset(self, event):
+        if (
+            not self._topic
+            or not event.is_private_chat()
+            or self._session_reset_command(event) != "reset"
+        ):
+            return
+        if not event.get_extra(
+            ExtraKeys.SESSION_CLEAN_GROUP, False
+        ) and not event.get_extra(ExtraKeys.SESSION_CLEAN_LEGACY, False):
+            return  # A denied or failed reset must not erase the plugin state.
+        if event.get_extra("_context_aware_topic_reset_done", False):
+            return
+        try:
+            cid = await self._context.conversation_manager.get_curr_conversation_id(
+                event.unified_msg_origin
+            )
+            if cid:
+                await self._topic.clear(event.unified_msg_origin, str(cid))
+            event.set_extra("_context_aware_topic_reset_done", True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._topic_faulted = True
+            logger.warning(f"[ContextAware Topic] reset failed: {type(exc).__name__}")
 
     @staticmethod
     def _extract_command_name(text: Any) -> str:
@@ -3260,6 +3458,9 @@ class Main(ImageReferenceAPI, star.Star):
         self, event: AstrMessageEvent, *args: Any, **kwargs: Any
     ) -> None:
         """监听所有消息，记录到历史"""
+        if self._is_topic_inspect(event):
+            return
+        await self._topic_reset(event)
         self._stamp_image_event(event)
         try:
             await self._prepare_event_images_for_llm(event)
@@ -3343,6 +3544,9 @@ class Main(ImageReferenceAPI, star.Star):
         self, event: AstrMessageEvent, req: ProviderRequest
     ) -> None:
         """在 LLM 请求前注入场景描述"""
+        if self._is_topic_inspect(event):
+            return
+        await self._topic_request(event, req)
         self._stamp_image_event(event)
         # Clean before the legacy history compressor materializes old images.
         contexts, removed = strip_tool_images(getattr(req, "contexts", None))
@@ -3432,7 +3636,11 @@ class Main(ImageReferenceAPI, star.Star):
                     pass
 
             # 可选：压缩历史（会裁剪 flow_source 对应的底层会话）
-            snapshot2 = await self._maybe_compress_history(umo, snapshot)
+            snapshot2 = (
+                snapshot
+                if self._topic and event.is_private_chat()
+                else await self._maybe_compress_history(umo, snapshot)
+            )
             if snapshot2 is not snapshot:
                 snapshot = snapshot2
                 flow_source = snapshot.messages
@@ -3506,11 +3714,13 @@ class Main(ImageReferenceAPI, star.Star):
                 bot_status=bot_status,
                 participants=participants,
                 summary=snapshot.summary,
-                show_flow=bool(self._cfg("enable_dialogue_flow", True)),
+                show_flow=bool(self._cfg("enable_dialogue_flow", True))
+                and not (self._topic and event.is_private_chat()),
                 show_recent_images=self._show_recent_images,
                 show_recent_gifs=self._show_recent_images_allow_gif,
                 image_flow=image_flow,
                 voice_flow=voice_flow,
+                private_chat=event.is_private_chat(),
             )
 
             # 注入场景描述到请求（v3.0.0: 防止重复注入）
@@ -3540,6 +3750,22 @@ class Main(ImageReferenceAPI, star.Star):
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse) -> None:
         """记录 Bot 回复"""
+        receipt = event.get_extra(RECEIPT)
+        if (
+            self._topic
+            and receipt
+            and resp
+            and getattr(resp, "role", "assistant") == "assistant"
+            and resp.completion_text
+        ):
+            try:
+                await self._topic.finish(receipt, resp.completion_text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    f"[ContextAware Topic] response bypass: {type(exc).__name__}"
+                )
         if not self._should_process(event):
             return
 
@@ -3585,6 +3811,7 @@ class Main(ImageReferenceAPI, star.Star):
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
         """跟随系统 reset/new/switch 清空本插件会话上下文（不注册新指令，避免冲突）"""
+        await self._topic_reset(event)
         try:
             clean_marker = (
                 ExtraKeys.SESSION_CLEAN_GROUP
@@ -3746,6 +3973,8 @@ class Main(ImageReferenceAPI, star.Star):
 
     async def terminate(self) -> None:
         """清理资源"""
+        if self._topic:
+            await self._topic.close()
         await self._image_index.close()
         if self._image_cache_cleanup_task:
             self._image_cache_cleanup_task.cancel()

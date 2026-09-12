@@ -66,6 +66,7 @@ def install_astrbot_stubs() -> dict[str, types.ModuleType]:
         PlatformAdapterType=PlatformAdapterType,
         platform_adapter_type=_decorator,
         on_llm_request=_decorator,
+        command=_decorator,
         on_llm_response=_decorator,
         after_message_sent=_decorator,
         llm_tool=_decorator,
@@ -493,17 +494,18 @@ class V320ChangesTest(unittest.TestCase):
         trigger, _ = analyzer.detect_trigger(event, message)
         self.assertEqual(trigger, self.mod.TRIGGER_AT_ALL)
 
-    def test_version_is_360(self):
-        """插件版本应为 3.6.x"""
+    def test_version_matches_metadata(self):
+        """源码与插件元数据应声明同一版本。"""
         import re
 
         with open(PLUGIN_PATH, encoding="utf-8") as f:
             content = f.read()
         match = re.search(r"^Version:\s*(\S+)", content, re.MULTILINE)
         self.assertIsNotNone(match, "找不到 Version 字段")
-        self.assertTrue(
-            match.group(1) == "3.6.0", f"期望 3.6.0，实际: {match.group(1)}"
-        )
+        metadata = PLUGIN_PATH.with_name("metadata.yaml").read_text(encoding="utf-8")
+        declared = re.search(r"^version:\s*(\S+)", metadata, re.MULTILINE)
+        self.assertIsNotNone(declared)
+        self.assertEqual(match.group(1), declared.group(1))
 
 
 if __name__ == "__main__":

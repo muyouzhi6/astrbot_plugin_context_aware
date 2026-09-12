@@ -1,29 +1,33 @@
 {
   "enable": {
-    "description": "启用上下文场景感知",
+    "description": "启用上下文增强",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "控制群聊场景、私聊场景及私聊话题摘要。LLM 请求图片压缩使用独立开关。"
   },
   "bot_names": {
-    "description": "Bot的各种称呼（用于检测被提及，不填则不检测）",
+    "description": "Bot 昵称列表",
     "type": "list",
     "default": [],
-    "hint": "例如填写: 小助手, 机器人, bot"
+    "hint": "用于识别消息中对 Bot 的称呼。留空时不按昵称识别提及，例如：小助手、机器人、bot。"
   },
   "max_history": {
-    "description": "每个群保留的最大历史消息数",
+    "description": "场景历史消息上限",
     "type": "int",
-    "default": 50
+    "default": 50,
+    "hint": "每个场景会话保留的消息数量。用于群聊及已启用场景提示的私聊；不控制独立的私聊话题摘要数据库。"
   },
   "max_groups": {
-    "description": "最大缓存群数量（LRU淘汰策略，防止内存溢出）",
+    "description": "场景会话缓存上限",
     "type": "int",
-    "default": 100
+    "default": 100,
+    "hint": "超出上限时淘汰最久未使用的场景会话，限制内存占用。"
   },
   "dialogue_window": {
-    "description": "注入LLM的对话流窗口大小（最近N条消息）",
+    "description": "对话流分析窗口（消息数）",
     "type": "int",
-    "default": 8
+    "default": 8,
+    "hint": "用于分析近期对话关系的消息范围；场景提示使用简短预览，不会完整重放该窗口内的所有消息。"
   },
   "enable_dialogue_flow": {
     "description": "启用对话流分析（谁在和谁说话）",
@@ -31,9 +35,10 @@
     "default": true
   },
   "only_group_chat": {
-    "description": "仅对群聊生效（私聊场景无需复杂分析）",
+    "description": "场景分析仅用于群聊（兼容配置）",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "用于兼容未设置「私聊：场景提示」的旧配置。已设置私聊场景开关时，以该开关为准；本项不控制私聊话题摘要。"
   },
   "strict_mode": {
     "description": "严格模式：主动触发场景下强制不推断「用户在和Bot说话」",
@@ -46,6 +51,109 @@
     "type": "bool",
     "default": true,
     "hint": "建议关闭 AstrBot 内置群聊上下文感知，避免和本插件重复注入群聊历史"
+  },
+  "debug_inference": {
+    "description": "启用推断规则调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "启用后会在日志中输出每条消息的对话对象推断过程"
+  },
+  "reply_starters": {
+    "description": "回复特征词（用于判断用户是否在回复Bot）",
+    "type": "list",
+    "default": [],
+    "hint": "留空使用默认词库。例如: 好的, 谢谢, 明白了"
+  },
+  "history_compress_strategy": {
+    "description": "群聊历史压缩策略（可选）",
+    "type": "string",
+    "default": "off",
+    "options": [
+      "off",
+      "llm_summary"
+    ],
+    "labels": [
+      "关闭",
+      "LLM 摘要压缩"
+    ],
+    "hint": "开启后会额外调用一次 LLM 来生成摘要，用于降低上下文膨胀与误判风险。"
+  },
+  "history_compress_trigger_count": {
+    "description": "触发压缩的消息数阈值",
+    "type": "int",
+    "default": 48,
+    "min": 20,
+    "max": 500,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_keep_recent": {
+    "description": "压缩时保留最近消息数",
+    "type": "int",
+    "default": 16,
+    "min": 5,
+    "max": 200,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_min_interval_sec": {
+    "description": "两次压缩的最小间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "min": 30,
+    "max": 86400,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_provider_id": {
+    "description": "用于历史压缩的模型提供商 ID（留空则使用当前会话默认模型）",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_instruction": {
+    "description": "历史压缩提示词（留空使用内置默认）",
+    "type": "text",
+    "default": "",
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_timeout": {
+    "description": "历史压缩超时时间（秒）",
+    "type": "int",
+    "default": 60,
+    "min": 10,
+    "max": 600,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_max_input_chars": {
+    "description": "压缩输入最大字符数（超出时从末尾截取）",
+    "type": "int",
+    "default": 5000,
+    "min": 1000,
+    "max": 50000,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
+  },
+  "history_compress_max_summary_chars": {
+    "description": "摘要最大字符数（超出截断）",
+    "type": "int",
+    "default": 800,
+    "min": 200,
+    "max": 5000,
+    "condition": {
+      "history_compress_strategy": "llm_summary"
+    }
   },
   "show_recent_images": {
     "description": "在场景提示中单独列出最近图片消息",
@@ -78,18 +186,6 @@
     "max": 500,
     "hint": "从最近 N 条消息中单独提取 Gemini_STT 的语音转写并注入；0 表示关闭"
   },
-  "debug_inference": {
-    "description": "启用推断规则调试日志",
-    "type": "bool",
-    "default": false,
-    "hint": "启用后会在日志中输出每条消息的对话对象推断过程"
-  },
-  "reply_starters": {
-    "description": "回复特征词（用于判断用户是否在回复Bot）",
-    "type": "list",
-    "default": [],
-    "hint": "留空使用默认词库。例如: 好的, 谢谢, 明白了"
-  },
   "llm_image_compress": {
     "description": "LLM 请求图片压缩",
     "type": "object",
@@ -104,9 +200,9 @@
       "min_size_mb": {
         "description": "触发压缩的文件大小（MB）",
         "type": "float",
-        "default": 4.0,
+        "default": 4,
         "min": 0.1,
-        "max": 100.0,
+        "max": 100,
         "hint": "文件达到此大小, 或最长边超过下方阈值时触发压缩。"
       },
       "max_edge": {
@@ -136,17 +232,17 @@
       "max_output_size_mb": {
         "description": "单图目标输出大小（MB）",
         "type": "float",
-        "default": 2.0,
+        "default": 2,
         "min": 0.1,
-        "max": 50.0,
+        "max": 50,
         "hint": "超过目标时会先降低 JPEG 质量, 再逐步缩小分辨率。"
       },
       "max_input_size_mb": {
         "description": "允许处理的单图大小上限（MB）",
         "type": "float",
-        "default": 50.0,
-        "min": 1.0,
-        "max": 200.0,
+        "default": 50,
+        "min": 1,
+        "max": 200,
         "hint": "保护服务器内存。超过上限时保留原引用并记录警告。"
       },
       "download_retries": {
@@ -289,95 +385,158 @@
       "image_caption_lazy": true
     }
   },
-  "history_compress_strategy": {
-    "description": "群聊历史压缩策略（可选）",
-    "type": "string",
-    "default": "off",
-    "options": [
-      "off",
-      "llm_summary"
-    ],
-    "labels": [
-      "关闭",
-      "LLM 摘要压缩"
-    ],
-    "hint": "开启后会额外调用一次 LLM 来生成摘要，用于降低上下文膨胀与误判风险。"
+  "enable_private_chat": {
+    "description": "私聊：场景提示",
+    "type": "bool",
+    "default": true,
+    "hint": "为私聊补充当前发言者、对话场景及图片提示。此功能不持久化话题摘要；启用「私聊：话题摘要」后，不再重复注入简短对话预览。"
   },
-  "history_compress_trigger_count": {
-    "description": "触发压缩的消息数阈值",
-    "type": "int",
-    "default": 48,
-    "min": 20,
-    "max": 500,
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_keep_recent": {
-    "description": "压缩时保留最近消息数",
-    "type": "int",
-    "default": 16,
-    "min": 5,
-    "max": 200,
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_min_interval_sec": {
-    "description": "两次压缩的最小间隔（秒）",
-    "type": "int",
-    "default": 300,
-    "min": 30,
-    "max": 86400,
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_provider_id": {
-    "description": "用于历史压缩的模型提供商 ID（留空则使用当前会话默认模型）",
-    "type": "string",
-    "default": "",
-    "_special": "select_provider",
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_instruction": {
-    "description": "历史压缩提示词（留空使用内置默认）",
-    "type": "text",
-    "default": "",
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_timeout": {
-    "description": "历史压缩超时时间（秒）",
-    "type": "int",
-    "default": 60,
-    "min": 10,
-    "max": 600,
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_max_input_chars": {
-    "description": "压缩输入最大字符数（超出时从末尾截取）",
-    "type": "int",
-    "default": 5000,
-    "min": 1000,
-    "max": 50000,
-    "condition": {
-      "history_compress_strategy": "llm_summary"
-    }
-  },
-  "history_compress_max_summary_chars": {
-    "description": "摘要最大字符数（超出截断）",
-    "type": "int",
-    "default": 800,
-    "min": 200,
-    "max": 5000,
-    "condition": {
-      "history_compress_strategy": "llm_summary"
+  "private_topic": {
+    "description": "私聊：话题摘要",
+    "type": "object",
+    "hint": "为长时间私聊补充话题背景和讨论进度，支持后台增量摘要、备用模型及重启恢复。默认关闭，可独立使用，无需安装其他记忆插件。仅从启用后的对话积累数据，无法恢复此前已被 AstrBot 删除的历史。",
+    "items": {
+      "log_injected_content": {
+        "description": "记录实际注入内容到日志",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后，以 INFO 日志记录每次私聊请求实际注入的话题摘要和原文片段，包括会话标识。日志可能包含私聊正文，默认关闭。私聊发送“短期记忆”可直接查看当前会话最近一次请求的注入内容，无需开启本项。"
+      },
+      "enabled": {
+        "description": "启用私聊话题摘要",
+        "type": "bool",
+        "default": false,
+        "hint": "后台提取私聊中的话题、约束、修正和讨论进度，用于补充后续回复的上下文。额外模型调用可能产生费用；主对话不等待摘要完成。仅存储文本及已有语音转写，不处理图片或音频原文件。"
+      },
+      "provider_mode": {
+        "description": "摘要模型选择方式",
+        "type": "string",
+        "default": "跟随当前会话",
+        "options": [
+          "跟随当前会话",
+          "单独指定"
+        ],
+        "hint": "跟随当前会话：使用当前私聊的聊天模型及其生效的 AstrBot 备用模型列表。单独指定：使用下方配置的摘要模型与备用列表。"
+      },
+      "provider_id": {
+        "description": "摘要模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "选择「单独指定」时必填。选择已在 AstrBot 中配置的聊天模型，复用其连接和认证信息。"
+      },
+      "fallback_provider_ids": {
+        "description": "备用摘要模型列表",
+        "type": "list",
+        "default": [],
+        "hint": "选择「单独指定」时使用。填写 AstrBot 模型配置中的完整 Provider ID，按列表顺序尝试；留空表示不使用备用模型。"
+      },
+      "content_refusal_policy": {
+        "description": "内容拒绝处理策略",
+        "type": "string",
+        "default": "保留原文，跳过这批",
+        "options": [
+          "保留原文，跳过这批",
+          "尝试备用模型"
+        ],
+        "hint": "模型拒绝生成摘要时，可保留原文并跳过当前批次，或在本次时间与次数限制内尝试备用模型。失败结果不会替换已有摘要，后续新消息仍可继续处理。"
+      },
+      "injection_token_budget": {
+        "description": "上下文补充预算（估算 token）",
+        "type": "int",
+        "default": 1800,
+        "min": 300,
+        "max": 6000,
+        "hint": "每次回复补充的摘要和未总结原文共用此预算。增大预算可保留更多内容，同时可能增加模型输入费用和响应时间。"
+      },
+      "update_after_turns": {
+        "description": "摘要更新轮数阈值",
+        "type": "int",
+        "default": 4,
+        "min": 1,
+        "max": 20,
+        "hint": "一轮指一条用户消息及对应的 Bot 生成回复。累计轮数或未总结文本量达到任一阈值后，安排后台摘要任务。"
+      },
+      "update_after_input_tokens": {
+        "description": "摘要更新文本阈值（估算 token）",
+        "type": "int",
+        "default": 3000,
+        "min": 500,
+        "max": 20000,
+        "hint": "未总结文本达到此数量时触发后台摘要，适用于单轮消息较长的场景。与轮数阈值满足任一条件即可。"
+      },
+      "min_update_interval_sec": {
+        "description": "摘要最小更新间隔（秒）",
+        "type": "int",
+        "default": 60,
+        "min": 10,
+        "max": 3600,
+        "hint": "同一私聊会话两次摘要任务之间的最短间隔。间隔内新增消息保留至后续批次；所有私聊共用一个后台任务队列。"
+      },
+      "summary_input_token_budget": {
+        "description": "单次摘要输入预算（估算 token）",
+        "type": "int",
+        "default": 8000,
+        "min": 5000,
+        "max": 16000,
+        "hint": "单次摘要输入包含已有摘要、聊天片段及摘要提示词。长消息分段处理，尚未处理的内容保留至后续批次。"
+      },
+      "attempt_timeout_sec": {
+        "description": "单模型请求超时（秒）",
+        "type": "int",
+        "default": 25,
+        "min": 5,
+        "max": 120,
+        "hint": "单个摘要模型请求的等待上限。超时后可在总时间预算内尝试备用模型，不阻塞主对话。"
+      },
+      "job_timeout_sec": {
+        "description": "摘要任务总超时（秒）",
+        "type": "int",
+        "default": 60,
+        "min": 10,
+        "max": 180,
+        "hint": "整个摘要任务共用的时间上限，包含所有候选模型请求。超时后保留已有摘要及待处理内容，按退避策略重新安排。"
+      },
+      "max_provider_attempts": {
+        "description": "单任务候选模型上限",
+        "type": "int",
+        "default": 3,
+        "min": 1,
+        "max": 5,
+        "hint": "包含主模型。按 Provider ID 去重后依次尝试，每个候选在同一任务中调用一次；服务商内部可能另有重试。"
+      },
+      "daily_request_budget": {
+        "description": "每日摘要请求上限",
+        "type": "int",
+        "default": 100,
+        "min": 1,
+        "max": 10000,
+        "hint": "所有私聊会话共用，备用模型调用和失败请求均计数。达到上限后暂停后台摘要，主对话继续。按 UTC 日期重置（UTC+8 时区为每日 08:00）。"
+      },
+      "daily_input_token_budget": {
+        "description": "每日摘要输入预算（估算 token）",
+        "type": "int",
+        "default": 200000,
+        "min": 2000,
+        "max": 10000000,
+        "hint": "所有私聊共用。请求前保守预扣，失败请求也计入。仅统计摘要输入，不包含主对话、模型输出或服务商内部重试费用，不等同于账单金额。"
+      },
+      "raw_retention_days": {
+        "description": "原文保留期限（天）",
+        "type": "int",
+        "default": 30,
+        "min": 1,
+        "max": 180,
+        "hint": "本地原文用于摘要失败时的上下文补充及结果核查。活跃会话保留摘要；超过此期限未活跃的会话连同摘要清理。成功执行 /reset 清理当前会话，切换会话分别保留各自数据。"
+      },
+      "storage_limit_mb": {
+        "description": "话题数据存储预算（MB）",
+        "type": "int",
+        "default": 100,
+        "min": 8,
+        "max": 500,
+        "hint": "为本地数据库设置容量预算，并预留索引和日志等开销。达到清理阈值时优先淘汰最久未活跃的会话。写入失败时暂停相关处理，主对话继续。"
+      }
     }
   }
 }

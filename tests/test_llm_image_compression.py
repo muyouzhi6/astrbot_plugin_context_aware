@@ -194,6 +194,9 @@ class FakeCompressionEvent:
     def is_private_chat(self):
         return self.private
 
+    def get_message_str(self):
+        return ""
+
     def track_temporary_local_file(self, path: str):
         self.tracked.append(path)
 
