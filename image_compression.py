@@ -8,6 +8,11 @@ from typing import Any, Mapping
 from PIL import Image as PILImage
 from PIL import ImageOps
 
+try:
+    from .gif_frames import GifOptions, prepare_gif
+except ImportError:
+    from gif_frames import GifOptions, prepare_gif
+
 
 MIB = 1024 * 1024
 LANCZOS = getattr(PILImage, "Resampling", PILImage).LANCZOS
@@ -76,6 +81,8 @@ class CompressionOutcome:
     output_size: tuple[int, int] | None
     changed: bool
     reason: str
+    output_paths: tuple[str, ...] = ()
+    note: str = ""
 
 
 def _unchanged(
@@ -114,6 +121,7 @@ def compress_local_image(
     source_path: str,
     output_dir: str,
     options: ImageCompressionOptions,
+    gif_options: GifOptions | None = None,
 ) -> CompressionOutcome:
     """Create a provider-facing image copy without modifying the source file."""
     path = Path(source_path)
@@ -132,14 +140,52 @@ def compress_local_image(
             reason="source_too_large",
         )
 
+    # GIF normalization is independent of optional static-image compression.
+    # Read the signature before opening Pillow; no unbounded n_frames scan.
+    try:
+        with path.open("rb") as handle:
+            is_gif = handle.read(6) in (b"GIF87a", b"GIF89a")
+        if is_gif:
+            limits = gif_options or GifOptions()
+            if source_bytes > limits.max_source_bytes:
+                return _unchanged(source_path, source_bytes=source_bytes, reason="source_too_large")
+            with path.open("rb") as handle:
+                result = prepare_gif(handle.read(limits.max_source_bytes + 1), limits)
+            if not result.images:
+                return _unchanged(source_path, source_bytes=source_bytes, reason=result.reason)
+            outputs = []
+            try:
+                destination = Path(output_dir)
+                destination.mkdir(parents=True, exist_ok=True)
+                for data, mime in result.images:
+                    suffix = ".png" if mime == "image/png" else ".jpg"
+                    target = destination / f"context-aware-compressed-{uuid.uuid4().hex}{suffix}"
+                    outputs.append(str(target))
+                    with target.open("xb") as handle:
+                        target.chmod(0o600)
+                        handle.write(data)
+                with PILImage.open(outputs[0]) as preview:
+                    size = preview.size
+                return CompressionOutcome(
+                    source_path, outputs[0], source_bytes,
+                    sum(len(data) for data, _ in result.images), None, size, True,
+                    result.reason, tuple(outputs), result.note,
+                )
+            except Exception:
+                for output in outputs:
+                    Path(output).unlink(missing_ok=True)
+                raise
+        if not options.enabled:
+            return _unchanged(source_path, source_bytes=source_bytes, reason="disabled")
+    except Exception as exc:
+        return _unchanged(source_path, source_bytes=source_bytes, reason=f"error:{type(exc).__name__}")
+
     candidate_path: Path | None = None
     working_image: PILImage.Image | None = None
     try:
         with PILImage.open(path) as opened_image:
             source_size = opened_image.size
-            image_format = str(opened_image.format or "").upper()
-            is_gif = image_format == "GIF"
-            if not is_gif and (
+            if (
                 getattr(opened_image, "is_animated", False)
                 or getattr(
                     opened_image,
@@ -155,7 +201,7 @@ def compress_local_image(
                     reason="animated_image",
                 )
 
-            if not is_gif and (
+            if (
                 source_bytes < options.min_size_bytes
                 and max(source_size) <= options.max_edge
             ):
@@ -166,11 +212,9 @@ def compress_local_image(
                     reason="below_threshold",
                 )
 
-            if is_gif:
-                opened_image.seek(0)
             working_image = ImageOps.exif_transpose(opened_image)
             working_image.load()
-            alpha = is_gif or _has_alpha(working_image)
+            alpha = _has_alpha(working_image)
             suffix = ".png" if alpha else ".jpg"
 
             destination = Path(output_dir)
@@ -248,7 +292,7 @@ def compress_local_image(
                 )
 
             output_bytes = candidate_path.stat().st_size
-            if output_bytes >= source_bytes and not is_gif:
+            if output_bytes >= source_bytes:
                 candidate_path.unlink(missing_ok=True)
                 return _unchanged(
                     source_path,
@@ -266,13 +310,9 @@ def compress_local_image(
                 output_size=output_size,
                 changed=True,
                 reason=(
-                    "gif_first_frame"
-                    if is_gif
-                    else (
-                        "compressed"
-                        if output_bytes <= options.max_output_bytes
-                        else "compressed_above_target"
-                    )
+                    "compressed"
+                    if output_bytes <= options.max_output_bytes
+                    else "compressed_above_target"
                 ),
             )
     except Exception as exc:  # noqa: BLE001

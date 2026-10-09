@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 
@@ -55,6 +55,18 @@ class IndexTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.index.close()
+
+    async def test_no_vision_gif_read_does_not_generate_preview_or_change_original(self):
+        from test_gif_frames import gif_bytes
+        raw = gif_bytes()
+        msg = message()
+        msg.has_gif = True
+        msg.image_urls = ["data:image/gif;base64," + base64.b64encode(raw).decode()]
+        image_id = self.index.add("g", msg, 1, allow_gif=True)[0]
+        with patch("image_context.prepare_gif", side_effect=AssertionError):
+            self.assertIsNone(await self.index.read("g", image_id, all_frames=True, capability="none"))
+        self.assertEqual(await self.index.read_bytes("g", image_id), raw)
+        self.assertEqual(self.index.get("g", image_id).preview_note, "[动图]")
 
     async def test_scope_watermark_and_snapshot_stability(self):
         first = self.index.add("g1", message(), 1)
@@ -420,3 +432,47 @@ class PluginToolTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GifRecallTests(unittest.IsolatedAsyncioTestCase):
+    async def test_recall_grid_frames_and_original_handoff(self):
+        from gif_frames import GifOptions
+        from test_gif_frames import gif_bytes
+        raw = gif_bytes()
+        for mode, count in (("grid", 1), ("frames", 3), ("first_frame", 1)):
+            index = ImageIndex(gif_options=GifOptions(mode=mode))
+            msg = message()
+            msg.has_gif = True
+            msg.image_urls = ["data:image/gif;base64," + base64.b64encode(raw).decode()]
+            ids = index.add("g1", msg, 1, allow_gif=True)
+            try:
+                payload = await index.read("g1", ids[0], all_frames=True)
+                self.assertEqual(len(payload), count)
+                self.assertEqual(await index.read_bytes("g1", ids[0]), raw)
+                self.assertEqual(len(index.get("g1", ids[0]).data), len(raw))
+            finally:
+                await index.close()
+
+    async def test_disallowed_gif_stays_out_of_index(self):
+        index = ImageIndex()
+        msg = message()
+        msg.has_gif = True
+        try:
+            self.assertFalse(index.add("g1", msg, 1, allow_gif=False))
+        finally:
+            await index.close()
+
+
+    async def test_single_gif_recall_does_not_claim_motion(self):
+        from test_gif_frames import gif_bytes
+        raw = gif_bytes(colors=("red",))
+        index = ImageIndex()
+        msg = message()
+        msg.has_gif = True
+        msg.image_urls = ["data:image/gif;base64," + base64.b64encode(raw).decode()]
+        ids = index.add("g1", msg, 1, allow_gif=True)
+        try:
+            self.assertIsNotNone(await index.read("g1", ids[0]))
+            self.assertEqual(index.get("g1", ids[0]).preview_note, "")
+        finally:
+            await index.close()

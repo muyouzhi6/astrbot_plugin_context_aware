@@ -165,7 +165,7 @@
     "description": "允许将GIF图片消息加入最近图片上下文",
     "type": "bool",
     "default": false,
-    "hint": "仅控制<recent_images>和图像转述；关闭时GIF不会进入该场景区块。AstrBot持久化历史中的GIF由已启用的LLM请求图片压缩提取首帧为PNG",
+    "hint": "控制最近图片场景、图片回看和图像转述中的 GIF。当前请求及持久化历史中的 GIF 始终按 gif_mode 预处理。",
     "condition": {
       "show_recent_images": true
     }
@@ -185,6 +185,151 @@
     "min": 0,
     "max": 500,
     "hint": "从最近 N 条消息中单独提取 Gemini_STT 的语音转写并注入；0 表示关闭"
+  },
+  "gif_mode": {
+    "description": "GIF 输出方式",
+    "type": "string",
+    "default": "grid",
+    "hint": "grid 按时间编号拼图；frames 输出独立帧图；first_frame 使用首帧。独立于静态图片压缩开关。",
+    "options": [
+      "grid",
+      "frames",
+      "first_frame"
+    ]
+  },
+  "gif_max_frames": {
+    "description": "GIF 最多抽取帧数",
+    "type": "int",
+    "default": 6,
+    "hint": "按累计帧时长均匀采样，再去掉相邻近似重复帧。"
+  },
+  "gif_frame_max_edge": {
+    "description": "抽帧图片最长边（像素）",
+    "type": "int",
+    "default": 512,
+    "hint": "用于 GIF 单格、独立帧图和视频回退帧。"
+  },
+  "gif_max_total_pixels": {
+    "description": "抽帧输出总像素上限",
+    "type": "int",
+    "default": 2000000,
+    "hint": "包含网格留白与序号文字；独立帧图按总和计算。"
+  },
+  "gif_max_output_bytes": {
+    "description": "抽帧输出总字节上限",
+    "type": "int",
+    "default": 2097152,
+    "hint": "超出时降低尺寸或改用 JPEG；独立帧图按总和计算。"
+  },
+  "gif_max_source_bytes": {
+    "description": "GIF 源文件字节上限",
+    "type": "int",
+    "default": 20971520,
+    "hint": "超过上限保留原引用，不执行解码。"
+  },
+  "gif_max_source_pixels": {
+    "description": "GIF 源画布像素上限",
+    "type": "int",
+    "default": 25000000,
+    "hint": "宽乘高；超过上限保留原引用，不执行解码。"
+  },
+  "gif_max_decode_frames": {
+    "description": "GIF 解码帧数上限",
+    "type": "int",
+    "default": 300,
+    "hint": "超过时尝试首帧；源文件大小和画布上限仍生效。"
+  },
+  "gif_timeout_sec": {
+    "description": "GIF 抽帧时限（秒）",
+    "type": "float",
+    "default": 5,
+    "hint": "线程中逐帧检查截止时间；超时再用独立时限尝试首帧。"
+  },
+  "gif_dedup_threshold": {
+    "description": "GIF 相邻帧去重阈值",
+    "type": "float",
+    "default": 2.0,
+    "hint": "缩略图 RGB 平均差，范围 0–30；越大去重越积极，0 只去掉相同帧。"
+  },
+  "video_understanding_enabled": {
+    "description": "启用视频理解",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后按实际请求模型三档处理：纯文本提示、图片抽帧、原生视频优先主请求；失败依次抽帧和文本。GIF 多帧独立默认开启。"
+  },
+  "video_max_bytes": {
+    "description": "视频源文件字节上限",
+    "type": "int",
+    "default": 52428800,
+    "hint": "每个视频在下载和读取时均检查大小。"
+  },
+  "video_max_duration_sec": {
+    "description": "视频时长上限（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "使用 ffprobe 检查，超出时加入“[视频：未能解析]”。"
+  },
+  "video_capability_override": {
+    "description": "GIF 与视频能力覆盖",
+    "type": "string",
+    "default": "auto",
+    "hint": "auto 按覆盖列表、Provider modalities 与模型家族判定。native 原生视频、frames 图片抽帧、none 文本提示；非 auto 优先级最高。旧 video_mode=frames/native 在 auto 下继续生效。",
+    "options": [
+      "auto",
+      "native",
+      "frames",
+      "none"
+    ]
+  },
+  "video_mode": {
+    "description": "旧视频模式兼容项",
+    "type": "string",
+    "default": "auto",
+    "invisible": true,
+    "hint": "保留旧配置，避免 AstrBot 配置完整性检查删除该键；新面板统一使用 video_capability_override。",
+    "options": ["auto", "native", "frames"]
+  },
+  "video_native_models": {
+    "description": "原生视频模型或 Provider 列表",
+    "type": "list",
+    "default": [],
+    "hint": "模型名或 Provider ID，不区分大小写，支持子串和 * ? 通配符。列表覆盖自动判定；多列表重叠时 none 优先，其次 frames，再次 native。"
+  },
+  "video_frames_only_models": {
+    "description": "图片抽帧模型或 Provider 列表",
+    "type": "list",
+    "default": [],
+    "hint": "模型名或 Provider ID 的子串或通配符，例如 gemini 或 vendor/*。强制视频抽帧，GIF 仍按 gif_mode。"
+  },
+  "video_no_vision_models": {
+    "description": "无视觉模型或 Provider 列表",
+    "type": "list",
+    "default": [],
+    "hint": "匹配后跳过视频下载、调用和抽帧，GIF 不生成帧图或网格，使用文本提示；普通静态图片沿用原行为。"
+  },
+  "video_fallback_frames": {
+    "description": "视频回退抽帧数",
+    "type": "int",
+    "default": 6,
+    "hint": "按时间均匀抽取；gif_mode=frames 使用独立帧，其余模式生成网格。沿用 GIF 单格、像素和字节上限。"
+  },
+  "video_inline_max_bytes": {
+    "description": "视频内联原文件字节上限",
+    "type": "int",
+    "default": 12582912,
+    "hint": "最高 12 MiB，并计算 Base64 与请求开销；较大文件用原生 Gemini Files API，兼容接口转抽帧。"
+  },
+  "video_timeout_sec": {
+    "description": "视频模型调用时限（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "下载最长 15 秒，本地处理每阶段最长 30 秒；模型调用含上传与轮询。"
+  },
+  "video_transcode": {
+    "description": "视频理解前转码",
+    "type": "bool",
+    "default": false,
+    "hint": "可选 ffmpeg H.264/AAC 转码，最长边 960、视频码率最高约 1.5 Mbps；失败用源视频继续。"
   },
   "llm_image_compress": {
     "description": "LLM 请求图片压缩",

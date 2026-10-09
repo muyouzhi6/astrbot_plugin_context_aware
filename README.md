@@ -4,6 +4,70 @@
 
 配置面板按群聊场景与历史摘要、图片与语音、私聊场景与话题摘要的顺序排列。功能更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
+## v3.8.0：动图与视频理解
+
+GIF 默认按累计帧时长均匀抽取最多 6 帧，去掉相邻近似重复画面，再生成一张带序号和时间的网格图。阅读顺序为从左到右、从上到下。`gif_mode=frames` 发送多张独立帧图；`first_frame` 使用首帧。当前附件、引用、请求历史、图片回看和图像转述使用同一套处理规则；GIF 处理独立于静态图片压缩开关。单帧 GIF 输出静态 PNG；PNG/JPEG/WebP 的原有处理方式保持不变，动画 WebP/APNG 沿用原处理方式。关闭静态图片压缩时，静态附件、历史图片和额外图片内容保持原引用，不为格式识别下载图片；开启压缩后复用已下载的本地引用，历史图片继续转换为自包含 data URI。
+
+`show_recent_images_allow_gif` 继续控制最近图片区块、回看索引及图像转述。当前附件和请求历史中的 GIF 按 `gif_mode` 处理。源 GIF 保留供图片引用接口使用，抽帧预览不会替换编辑参考。每张动图仍对应一个 `[图片]` 标记。
+
+视频理解默认关闭。开启 `video_understanding_enabled` 后处理 Video 组件和常见视频文件，按实际请求的模型与 Provider 分三档。GIF 多帧默认开启，不依赖视频开关。
+
+| 能力档位 | GIF | 视频（开启视频理解后） |
+|---|---|---|
+| `none` 无视觉 | 文本 `[动图]`，不生成帧图或网格 | 文本 `[视频：当前模型不支持查看]`，不读取视频、不调用模型、不抽帧 |
+| `frames` 图片视觉 | 按 `gif_mode` 多帧网格或独立图片 | ffmpeg 按时间抽帧，以 PNG/JPEG 图片进入主请求；接口拒绝后重试文本提示 |
+| `native` 原生视频 | 按 `gif_mode` 处理 | 真实视频优先进入主请求；接口拒绝后重试图片抽帧，再失败使用文本提示 |
+
+判定优先级：非 `auto` 的全局 `video_capability_override` → 三个覆盖列表 → 旧 `video_mode` → Provider `modalities` → 模型家族。列表匹配模型名或 Provider ID，支持不区分大小写的子串与 `*`、`?` 通配符；重叠时 `none` → `frames` → `native`。`modalities` 已配置且没有 `image` 时为 `none`；有 `image` 和 `video` 时为 `native`；有 `image` 时，Gemini、Qwen-VL/Omni、GLM-4V/4.xV、豆包 vision/seed 家族进入 `native`，其余为 `frames`。能识别 `newapigemini/gemini-3.8-flash` 等前缀名和 Provider ID。Provider 信息缺失、名称未知时默认 `frames`。普通 PNG/JPEG 等静态图片沿用原行为，由 AstrBot 核心按 modalities 过滤。
+
+AstrBot 4.28.2 的 ContentPart 支持文本、图片和音频。插件用临时标记穿过核心媒体处理，在 OpenAI/Gemini Provider 的请求入口转换成视频或抽帧图片 part，保留主请求的问题、历史与工具。原生 Gemini 小文件使用 `inline_data`，大文件使用 Files API，等待 ACTIVE 并在请求结束或取消时删除上传文件。缺少适配入口的原生视频 Provider 使用现有客户端预调用描述，再注入临时文本，该路径增加一次模型调用；抽帧结果采用文本提示。原生与图片重试仍保留普通静态附件；输入超限、ffmpeg/ffprobe 缺失或解析失败时使用 `[视频：未能解析]`。视频请求的流式结果在成功后交付，避免晚期失败产生重复回答。
+
+| OpenAI 兼容家族 | 主请求视频 content part |
+|---|---|
+| Gemini / New API | `{"type":"image_url","image_url":{"url":"data:video/mp4;base64,..."}}`，保留视频 MIME |
+| Qwen DashScope | `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}` |
+| GLM | `{"type":"video_url","video_url":{"url":"裸 Base64"}}`，在该条 content 中排在文本前 |
+| 豆包方舟 Chat | `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1}}` |
+
+Qwen 官方另支持 `{"type":"video","video":["帧 URL 或 data:image/...", "..."]}` 的有序帧列表（至少 4 张）。本插件原生档发送真实视频文件；第二档发送通用图片网格或独立 `image_url`，也用于原生失败后的回退。Qwen-VL 和抽帧路径读取画面；Qwen-Omni 等音视频模型可读取声音。GLM 的图像与视频混合请求若被接口拒绝，自动改用抽帧图片。
+
+GIF 解码、拼图与 ffmpeg 操作在线程或子进程执行。逐帧检查时限，GIF 超过解码帧数或遇到异常时尝试首帧；首帧也失败则保留原引用。解码前检查各帧描述符、偏移和累计画布尺寸；超过源大小或任一帧画布上限时直接保留原引用。单帧边长、输出总像素和总字节分别限制，序号文字也计入输出像素；PNG 过大时改用 JPEG 或缩小。视频 Base64 解码在工作线程执行；视频与新增 GIF 远程下载使用 HTTP/HTTPS，逐跳校验重定向及 DNS 地址，拒绝内网、回环和链路本地地址，并检查声明大小与实际读取字节。ffprobe 检查视频时长；本地处理每阶段最长 30 秒，临时目录在结束或取消时清理。
+
+| GIF 配置 | 默认值 |
+|---|---:|
+| `gif_mode` | `grid` |
+| `gif_max_frames` | `6` |
+| `gif_frame_max_edge` | `512` 像素 |
+| `gif_max_total_pixels` | `2000000` |
+| `gif_max_output_bytes` | `2097152`（2 MiB） |
+| `gif_max_source_bytes` | `20971520`（20 MiB） |
+| `gif_max_source_pixels` | `25000000` |
+| `gif_max_decode_frames` | `300` |
+| `gif_timeout_sec` | `5` 秒，首帧恢复另计一次 |
+| `gif_dedup_threshold` | `2.0`，32×32 RGB 缩略图平均差 |
+
+| 视频配置 | 默认值 |
+|---|---:|
+| `video_understanding_enabled` | `false` |
+| `video_max_bytes` | `52428800`（50 MiB） |
+| `video_max_duration_sec` | `120` 秒 |
+| `video_capability_override` | `auto`（选项 `auto/native/frames/none`） |
+| `video_native_models` | `[]` |
+| `video_frames_only_models` | `[]` |
+| `video_no_vision_models` | `[]` |
+| `video_fallback_frames` | `6` |
+| `video_inline_max_bytes` | `12582912`（12 MiB） |
+| `video_timeout_sec` | `60` 秒，包含模型调用、上传和轮询 |
+| `video_transcode` | `false` |
+
+内联阈值按原文件字节配置，最高 12 MiB；发送前再计算 Base64 膨胀、提示词及请求开销，将总量控制在 20 MB 以下。兼容接口的大视频直接转抽帧。可选转码输出 H.264/AAC MP4，最长边 960，视频码率上限约 1.5 Mbps、音频 64 kbps。视频回退图复用 GIF 的边长、总像素和输出字节配置。
+
+旧 `video_mode=frames/native` 在全局覆盖为 `auto` 且未命中覆盖列表时继续生效，无需改写旧配置；新面板统一使用 `video_capability_override`。按显示时长采样保留长停顿的权重，相邻帧差去重减少重复画面；独立帧模式提供更大的逐帧阅读空间。短于采样间隔的动作可能遗漏，抽帧图片不含声音。
+
+回归测试：`python3 -m pytest -q tests`、`python3 -m ruff check .`。真实框架测试使用 AstrBot 4.28.2，可通过 `ASTRBOT_TEST_PYTHON=/path/to/venv/bin/python` 指定已安装该版本的解释器；测试运行真实 Core、ContentPart、modalities 过滤与 OpenAI/Gemini Provider，SDK 响应由本地测试模拟。
+
+参考资料：[Gemini 视频理解](https://ai.google.dev/gemini-api/docs/video-understanding)、[Gemini Files API](https://ai.google.dev/gemini-api/docs/files)、[Qwen DashScope 视频与帧列表](https://help.aliyun.com/zh/model-studio/vision)、[DashScope OpenAI 兼容参数](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions)、[GLM 视频与 Base64 示例](https://docs.bigmodel.cn/cn/guide/models/vlm/glm-4v-plus-0111)、[豆包方舟视频理解](https://www.volcengine.com/docs/82379/1895586)、[New API 转 Gemini](https://github.com/QuantumNous/new-api/blob/128089fa7ddf41b575206a0feb28940d33793833/relaykit/relayconvert/internal/oai_chat/to_gemini_chat_req.go)、[AstrBot 4.28.2 ContentPart](https://github.com/AstrBotDevs/AstrBot/blob/v4.28.2/astrbot/core/agent/message.py)。
+
 ## v3.7.1 更新
 
 - 私聊发送 `短期记忆`，查看当前会话最近一次请求实际注入的话题摘要和原文补充，不调用模型、不把查看命令记入话题记录。
@@ -22,7 +86,7 @@
 - **容量公平**：单会话超限时优先淘汰占用图片数量最多的发送者的旧图，降低刷图挤掉其他人图片的概率。这不保证整条多图消息全部保留；目录显示原位置，缺失图片不可猜测。
 - **纯文本主模型**也能把明确图片 ID 交给 Gitee；只有实际视觉查看才要求聊天模型具备 image 能力。
 
-本轮目录在请求准备时冻结，工具调用期间的新图不自动加入。调用方应先完成消息记录再获取目录。reset/new、上下文清理或插件重载会使旧目录和结果登记凭据失效；后台任务输入已有独立副本，但旧任务不会把结果重新注册进清空后的上下文。缓存过期的父图片 ID 仅作来源记录，不代表原图仍可读取。
+本轮目录在请求准备时冻结，工具调用期间的新图不自动加入。调用方应先完成消息记录再获取目录。reset/new、上下文清理或插件重载会使旧目录和结果登记凭据失效；后台任务输入已有独立副本，但旧任务不会把结果重新注册进清空后的上下文。缓存过期的父图片 ID 保留来源记录；重新编辑时请重发原图。
 
 联动当前覆盖 `aiimg_generate` 的单图同步/后台路径；多张参考图可以合用，批量任务逐项引用、命令入口历史选图、重启后恢复图片索引不在本版范围内。需要历史参考的批量请求会明确拒绝，不会省略参考改成纯文生图。
 
@@ -51,7 +115,7 @@
 - 自动移除会话中已经失效的本地图片引用，单张过期图片不再拖垮整轮 LLM 请求。
 - 图片组件使用正确的 `file URI`/本地 `path` 语义，并复用规范化路径避免重复压缩。
 - 持久化会话历史中的图片也会进入 LLM 请求图片预处理，不再只处理当前消息和引用消息。
-- GIF 会在单次 LLM 请求中提取首帧为 PNG 临时副本，兼容不支持 `image/gif` 的模型。
+- GIF 在单次 LLM 请求中按 `gif_mode` 生成 PNG/JPEG 视觉副本，兼容图片模型。
 - 引用消息中的图片文件会按真实内容归一化为 `Image`, 避免 Core 再次回查 OneBot。
 - 自动支持 Pillow 可识别的 PNG、JPEG/JPG、WebP、GIF、BMP、TIFF、ICO 等图片格式。
 - 伪图片后缀和损坏文件保持原 `File`, 不会阻断正常消息处理。
@@ -74,11 +138,11 @@
 - **按需回看**：模型通过 `context_aware_view_images` 选择当前会话索引中的 ID；支持一次查看多张、`auto` 概览和 `high` 查看细节。像“这啥”“小王刚才那张截图怎么了”等表达由模型结合索引决定是否调用工具，不保证每种表达都触发自动带图。
 - **短期缓存**：Core 预处理产生的本地图片在消息结束前完成缓存接管，网络来源在后台预取。默认每会话 20 张、30 分钟，所有会话共用 64 MB 图片与来源预算。图片索引独立于文字消息窗口；后台预取最多 2 个并发、16 个待处理任务，队列繁忙时保留来源供按需加载。下载和解码工作内存不包括在 64 MB 中。
 - **避免反复带图**：自动图片使用临时内容标记。工具图片在当前 Core 中可能保存至本轮历史；清理依赖内置 Agent runner 的工具图片标记与相邻图像结构，第三方 runner 需单独验证；插件会在下次请求前精确移除本工具追加的历史图像，只保留文字与工具调用关系，不清理用户原生图或其他工具图。
-- **隔离与清空**：图片 ID 仅能在当前请求的会话快照使用；其他群、新到消息不会串入。`reset`、`new`、会话切换清理信号、插件重载或 Bot 重启会使旧索引失效。
+- **隔离与清空**：图片 ID 在当前请求的会话快照中使用；其他群、新到消息不会串入。`reset`、`new`、会话切换清理信号、插件重载或 Bot 重启会使旧索引失效。
 
 使用此功能需要当前聊天模型支持 **image**；按需工具还需要 **tool_use**，且 AstrBot 工具列表中的 `context_aware_view_images` 已启用。无需开启 `image_caption`，普通收图不会额外调用模型。模型没有视觉能力时，本功能不会生成虚构的图片描述。
 
-`auto` 的最长边为 1600，`high` 最长边为 4096，均为有大小限制的 JPEG 视觉副本；原消息和原图不修改，透明图片以白色背景合成。需要原始像素或精确小字时，请直接发送/引用原图。沿用 `show_recent_images_allow_gif` 设置；混有被过滤 GIF 的整条消息不加入回看索引，允许时仅查看首帧，不支持动态理解。图片输入上限沿用 `image_download_max_bytes` 并受内存预算约束，像素上限为 2500 万。
+`auto` 的最长边为 1600，`high` 最长边为 4096，均为有大小限制的 JPEG 视觉副本；原消息和原图不修改，透明图片以白色背景合成。需要原始像素或精确小字时，请直接发送/引用原图。沿用 `show_recent_images_allow_gif` 设置；混有被过滤 GIF 的整条消息不加入回看索引，允许时按 `gif_mode` 提供动图帧预览。图片输入上限沿用 `image_download_max_bytes` 并受内存预算约束，像素上限为 2500 万。
 
 图片只保留在短期缓存，过期、清空、重启或缓存压力淘汰后可能需要重发。预取不保证外部链接永久可用；只允许公网 HTTP(S) 图片下载，私网图片服务不会被回看工具访问。自动带图最多等待 2 秒，未准备好时交给按需工具；工具下载有超时与失败退避。
 
@@ -156,14 +220,14 @@ provider_settings:
 - 识别普通文本伪造的 `[图片]`、`[红包]`、`[转账]` 等标签，并校验 OneBot/NapCat 上报的真实结构化消息。
 - 检测到真实红包或转账事件时，会将可读描述写入 Context Aware 会话，让 Bot 在后续对话中知道“谁、何时、发了什么”。
 - 该联动是软依赖；未安装 Context Aware 时，消息真实性校验仍可独立工作。
-- 真实红包事件只代表平台上报了可信的钱包结构，不代表 Bot 已领取红包或资金已经到账。
+- 真实红包事件记录平台上报的钱包结构；领取状态和到账状态按平台回执核对。
 
 ### [算了不说了](https://github.com/muyouzhi6/astrbot_plugin_suanle_bushuo)
 
 - Context Aware 提供完整的群聊场景和对话对象判断，`算了不说了` 提供 `keep_silent` 工具，让 LLM 在不该插话或无需回复时主动保持沉默。
 - 支持黑名单强阻断，同时仍将被阻断用户的消息作为 `<blocked_messages>` 临时上下文提供给 LLM，避免群聊信息断裂。
-- 黑名单上下文由 `算了不说了` 独立维护，不调用 Context Aware 的清理接口，两个插件各自负责自己的数据边界。
-- `keep_silent` 依赖模型的 function-calling/tools-use 能力；不支持工具调用的模型无法保证自主沉默。
+- 黑名单上下文由 `算了不说了` 独立维护，不调用 Context Aware 的清理接口，两个插件分别管理自己的数据。
+- `keep_silent` 通过模型的 function-calling/tools-use 执行沉默操作，请配置支持工具调用的模型。
 
 ---
 

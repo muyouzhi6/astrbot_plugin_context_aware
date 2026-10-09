@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.7.1 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.8.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -15,6 +15,10 @@ AstrBot 上下文场景感知增强插件 v3.7.1 (Context-Aware Enhancement)
 - 只做加法，不修改框架原有信息
 - 可完全替代框架内置 LTM 的群聊记录功能
 - 轻量高效，图像转述为可选功能
+
+v3.8.0 更新:
+- [FEAT] GIF 按时长抽帧、去重及编号网格；可选独立帧图
+- [FEAT] 可选视频理解、Gemini 内联/上传和失败抽帧回退
 
 v3.7.1 更新:
 - [FEAT] 私聊短期记忆命令查看最近请求实际注入快照，支持重载恢复
@@ -87,13 +91,14 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.7.1
+Version: 3.8.0
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import http.client
 import json
@@ -118,6 +123,15 @@ from astrbot.api.message_components import At, AtAll, File, Image, Plain, Reply
 from astrbot.api.provider import LLMResponse, Provider, ProviderRequest
 from astrbot.core.agent.message import TextPart
 from PIL import Image as PILImage
+
+try:
+    from .gif_frames import GifOptions, prepare_gif
+    from .model_capability import detect_video_capability
+    from .video_input import MainVideoAdapter, NO_VISION, VideoOptions, VideoResult, is_video_component, understand_video, UNPARSED
+except ImportError:
+    from gif_frames import GifOptions, prepare_gif
+    from model_capability import detect_video_capability
+    from video_input import MainVideoAdapter, NO_VISION, VideoOptions, VideoResult, is_video_component, understand_video, UNPARSED
 
 try:
     from .image_context import (
@@ -1560,6 +1574,10 @@ class Main(ImageReferenceAPI, star.Star):
         self._image_compress_options = ImageCompressionOptions.from_mapping(
             self._cfg("llm_image_compress", {})
         )
+        self._gif_options = GifOptions.from_mapping(self._config)
+        self._video_options = VideoOptions.from_mapping(self._config)
+        self._video_adapters = {}
+        self._media_semaphore = asyncio.Semaphore(2)
         self._image_compress_output_dir = get_astrbot_temp_path()
 
         # v3.0.0: 图像转述并发控制
@@ -1629,6 +1647,7 @@ class Main(ImageReferenceAPI, star.Star):
             * 1024
             * 1024,
             max_download_bytes=self._image_download_max_bytes,
+            gif_options=self._gif_options,
         )
         self._scene_generator = SceneGenerator()
         self._stats = PluginStats()
@@ -1644,7 +1663,7 @@ class Main(ImageReferenceAPI, star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.7.1"
+        version = "3.8.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -2199,7 +2218,7 @@ class Main(ImageReferenceAPI, star.Star):
                     f.write(raw)
             return local_path
         except Exception as e:
-            logger.warning(f"[ContextAware] base64 data URI 保存失败: {e}")
+            logger.warning(f"[ContextAware] base64 data URI 保存失败: {type(e).__name__}")
             return None
 
     def _save_base64_image_to_local(
@@ -2228,7 +2247,7 @@ class Main(ImageReferenceAPI, star.Star):
                     f.write(raw)
             return local_path
         except Exception as e:
-            logger.warning(f"[ContextAware] base64 图片保存失败: {e}")
+            logger.warning(f"[ContextAware] base64 图片保存失败: {type(e).__name__}")
             return None
 
     def _cleanup_image_cache(self, force: bool = False) -> None:
@@ -2267,7 +2286,7 @@ class Main(ImageReferenceAPI, star.Star):
                 f"剩余 {total_size / 1024:.0f} KB"
             )
         except Exception as e:
-            logger.warning(f"[ContextAware] 缓存清理异常: {e}")
+            logger.warning(f"[ContextAware] 缓存清理异常: {type(e).__name__}")
 
         download_cache = getattr(self, "_image_download_cache", {})
         for cache_key, cached_path in list(download_cache.items()):
@@ -2297,6 +2316,7 @@ class Main(ImageReferenceAPI, star.Star):
             or not (
                 (self._image_caption_enabled and self._image_caption_lazy)
                 or self._image_compress_options.enabled
+                or self._gif_options.mode in ("grid", "frames", "first_frame")
             )
         ):
             return
@@ -2443,7 +2463,7 @@ class Main(ImageReferenceAPI, star.Star):
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning(f"[ContextAware] 图片下载异常: {e}")
+                    logger.warning(f"[ContextAware] 图片下载异常: {type(e).__name__}")
                     content_size = None
 
                 if content_size is not None:
@@ -2459,7 +2479,7 @@ class Main(ImageReferenceAPI, star.Star):
                     delay = min(0.5 * (2 ** (attempt - 1)), 2.0)
                     logger.warning(
                         f"[ContextAware] 图片下载失败, {delay:.1f}s 后重试 "
-                        f"({attempt}/{attempts}): {image_url[:60]}..."
+                        f"({attempt}/{attempts}): [远程图片]..."
                     )
                     await asyncio.sleep(delay)
 
@@ -2497,7 +2517,7 @@ class Main(ImageReferenceAPI, star.Star):
                 status = getattr(resp, "status", 200)
                 if status != 200:
                     logger.warning(
-                        f"[ContextAware] 图片下载失败 HTTP {status}: {image_url[:60]}..."
+                        f"[ContextAware] 图片下载失败 HTTP {status}: [远程图片]..."
                     )
                     return None
 
@@ -2510,7 +2530,7 @@ class Main(ImageReferenceAPI, star.Star):
                         cl = None
                     if cl is not None and cl > effective_limit:
                         logger.warning(
-                            f"[ContextAware] 图片过大 ({cl} bytes)，跳过缓存: {image_url[:60]}..."
+                            f"[ContextAware] 图片过大 ({cl} bytes)，跳过缓存: [远程图片]..."
                         )
                         return None
 
@@ -2525,7 +2545,7 @@ class Main(ImageReferenceAPI, star.Star):
                             logger.warning(
                                 f"[ContextAware] 图片下载超过上限 "
                                 f"({effective_limit} bytes)，已中止: "
-                                f"{image_url[:60]}..."
+                                f"[远程图片]..."
                             )
                             cleanup_partial()
                             return None
@@ -2537,14 +2557,14 @@ class Main(ImageReferenceAPI, star.Star):
                     cleanup_partial()
                     logger.warning(
                         f"[ContextAware] 图片下载不完整 ({total}/{cl} bytes): "
-                        f"{image_url[:60]}..."
+                        f"[远程图片]..."
                     )
                     return None
                 return total
         except urllib.error.HTTPError as e:
             cleanup_partial()
             logger.warning(
-                f"[ContextAware] 图片下载失败 HTTP {e.code}: {image_url[:60]}..."
+                f"[ContextAware] 图片下载失败 HTTP {e.code}: [远程图片]..."
             )
             return None
         except (
@@ -2555,7 +2575,7 @@ class Main(ImageReferenceAPI, star.Star):
             OSError,
         ) as e:
             cleanup_partial()
-            logger.warning(f"[ContextAware] 图片下载异常: {e}")
+            logger.warning(f"[ContextAware] 图片下载异常: {type(e).__name__}")
             return None
 
     @staticmethod
@@ -2646,6 +2666,22 @@ class Main(ImageReferenceAPI, star.Star):
             return local_path if os.path.isfile(local_path) else None
         if not image_ref.startswith(("http://", "https://", "data:", "base64://")):
             return image_ref if os.path.isfile(image_ref) else None
+        if image_ref.startswith(("http://", "https://")) and await asyncio.to_thread(_image_ref_looks_like_gif, image_ref):
+            # New GIF fetching uses the public-address/redirect-checked reader.
+            # Keep the pre-existing static-image downloader and cache semantics.
+            limit = min(options.max_input_bytes, self._gif_options.max_source_bytes)
+            reader = ImageIndex(max_download_bytes=limit, budget_bytes=limit)
+            try:
+                data = await asyncio.wait_for(reader._fetch(image_ref), options.download_timeout)
+                return await asyncio.to_thread(
+                    lambda: self._save_base64_image_to_local(
+                        "base64://" + base64.b64encode(data).decode("ascii"), max_bytes=limit,
+                    )
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return None
         return await self._download_image_to_local(
             image_ref,
             max_bytes=options.max_input_bytes,
@@ -2657,9 +2693,22 @@ class Main(ImageReferenceAPI, star.Star):
         self,
         event: AstrMessageEvent,
         image_ref: str,
+        *, allow_gif: bool = True,
     ) -> str:
         options = self._image_compress_options
-        if not options.enabled or not image_ref:
+        if not image_ref:
+            return image_ref
+
+        if not allow_gif and (
+            await asyncio.to_thread(_image_ref_looks_like_gif, image_ref)
+            or self._gif_expansion(event, image_ref)[1]
+            or self._is_gif_preview(event, image_ref)
+        ):
+            return ""
+
+        # 3.7.1 leaves static references untouched when compression is disabled.
+        # Identify GIFs from existing refs/bytes; never fetch just to sniff a format.
+        if not options.enabled and not await asyncio.to_thread(_image_ref_looks_like_gif, image_ref):
             return image_ref
 
         mapping = self._event_image_compress_map(event)
@@ -2671,23 +2720,40 @@ class Main(ImageReferenceAPI, star.Star):
         if not local_path:
             mapping[image_ref] = image_ref
             self._image_compress_errors += 1
-            logger.warning(
-                f"[ContextAware] LLM 图片压缩跳过, 无法读取图片: {image_ref[:80]}"
-            )
+            logger.debug("[ContextAware] 图片预处理跳过：来源不可读")
             return image_ref
 
+        is_gif = await asyncio.to_thread(_image_ref_looks_like_gif, local_path)
+        if is_gif and not allow_gif:
+            return ""
+        if not options.enabled and not is_gif:
+            mapping[image_ref] = image_ref
+            return image_ref
         try:
-            outcome = await asyncio.to_thread(
-                compress_local_image,
-                local_path,
-                self._image_compress_output_dir,
-                options,
-            )
+            async with self._media_semaphore:
+                task = asyncio.create_task(asyncio.to_thread(
+                    compress_local_image, local_path, self._image_compress_output_dir,
+                    options, self._gif_options,
+                ))
+                try:
+                    outcome = await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    try:
+                        outcome = await task
+                        if outcome.changed:
+                            for path in outcome.output_paths or (outcome.output_path,):
+                                try:
+                                    Path(path).unlink(missing_ok=True)
+                                except OSError:
+                                    self._track_temporary_image(event, path)
+                    except Exception:
+                        pass
+                    raise
         except asyncio.CancelledError:
             raise
-        except Exception as e:
+        except Exception as exc:
             self._image_compress_errors += 1
-            logger.warning(f"[ContextAware] LLM 图片压缩异常: {e}")
+            logger.warning(f"[ContextAware] 图片预处理异常: {type(exc).__name__}")
             return image_ref
         if not outcome.changed:
             effective_ref = local_path if os.path.isfile(local_path) else image_ref
@@ -2700,7 +2766,7 @@ class Main(ImageReferenceAPI, star.Star):
                 self._image_compress_errors += 1
                 logger.warning(
                     f"[ContextAware] LLM 图片压缩失败 ({outcome.reason}): "
-                    f"{image_ref[:80]}"
+                    f"[图片引用]"
                 )
             elif outcome.reason == "source_too_large":
                 logger.warning(
@@ -2709,10 +2775,19 @@ class Main(ImageReferenceAPI, star.Star):
                 )
             return effective_ref
 
-        self._track_temporary_image(event, outcome.output_path)
+        for output_path in outcome.output_paths or (outcome.output_path,):
+            self._track_temporary_image(event, output_path)
+        expansions = event.get_extra("_context_aware_gif_expansions", None)
+        if expansions is None:
+            expansions = {}
+            event.set_extra("_context_aware_gif_expansions", expansions)
+        payload = (outcome.output_paths or (outcome.output_path,), outcome.note)
+        for ref in (image_ref, local_path):
+            expansions[ref] = payload
         mapping[image_ref] = outcome.output_path
         mapping[local_path] = outcome.output_path
-        mapping[outcome.output_path] = outcome.output_path
+        for output_path in outcome.output_paths or (outcome.output_path,):
+            mapping[output_path] = output_path
         resolved_output_path = Path(outcome.output_path).resolve(strict=False)
         mapping[str(resolved_output_path)] = outcome.output_path
         mapping[resolved_output_path.as_uri()] = outcome.output_path
@@ -2739,16 +2814,20 @@ class Main(ImageReferenceAPI, star.Star):
         except Exception:
             return
 
+        allow_gif = self._media_capability(event)[0] != "none"
         for component in messages:
             if isinstance(component, Image):
                 if not self._image_compress_options.enabled:
                     continue
                 source_ref = self._component_image_ref(component)
+                if await asyncio.to_thread(_image_ref_looks_like_gif, source_ref):
+                    continue
                 compressed_ref = await self._compress_image_reference(
                     event,
                     source_ref,
+                    allow_gif=allow_gif,
                 )
-                if compressed_ref != source_ref:
+                if compressed_ref and compressed_ref != source_ref and not self._gif_expansion(event, source_ref)[1]:
                     self._replace_component_image_ref(component, compressed_ref)
             elif isinstance(component, Reply):
                 reply_chain = getattr(component, "chain", None) or []
@@ -2766,7 +2845,7 @@ class Main(ImageReferenceAPI, star.Star):
                             raise
                         except Exception as e:
                             logger.warning(
-                                f"[ContextAware] 引用文件图片识别失败, 已保留原文件: {e}"
+                                f"[ContextAware] 引用文件图片识别失败, 已保留原文件: {type(e).__name__}"
                             )
                             continue
 
@@ -2786,11 +2865,14 @@ class Main(ImageReferenceAPI, star.Star):
                     if not self._image_compress_options.enabled:
                         continue
                     source_ref = self._component_image_ref(reply_component)
+                    if await asyncio.to_thread(_image_ref_looks_like_gif, source_ref):
+                        continue
                     compressed_ref = await self._compress_image_reference(
                         event,
                         source_ref,
+                        allow_gif=allow_gif,
                     )
-                    if compressed_ref != source_ref:
+                    if compressed_ref and compressed_ref != source_ref and not self._gif_expansion(event, source_ref)[1]:
                         self._replace_component_image_ref(
                             reply_component,
                             compressed_ref,
@@ -2810,9 +2892,15 @@ class Main(ImageReferenceAPI, star.Star):
         Returns:
             None.
         """
-        if not self._image_compress_options.enabled:
-            return
-
+        no_vision = self._media_capability(event, req)[0] == "none"
+        gif_notes = {
+            note for _, note in (event.get_extra("_context_aware_gif_expansions", None) or {}).values()
+            if note
+        }
+        if no_vision:
+            for part in getattr(req, "extra_user_content_parts", []) or []:
+                if getattr(part, "text", None) in gif_notes:
+                    part.text = "[动图]"
         image_urls = getattr(req, "image_urls", None)
         replacements: dict[str, str] = {}
         if isinstance(image_urls, list):
@@ -2821,11 +2909,21 @@ class Main(ImageReferenceAPI, star.Star):
                 if not isinstance(image_ref, str) or not image_ref:
                     compressed_urls.append(image_ref)
                     continue
+                if no_vision and await asyncio.to_thread(_image_ref_looks_like_gif, image_ref):
+                    self._inject_scene(req, "[动图]")
+                    continue
                 compressed_ref = await self._compress_image_reference(
                     event,
                     image_ref,
+                    allow_gif=not no_vision,
                 )
-                compressed_urls.append(compressed_ref)
+                if not compressed_ref:
+                    self._inject_scene(req, "[动图]")
+                    continue
+                refs, note = self._gif_expansion(event, image_ref, compressed_ref)
+                compressed_urls.extend(refs)
+                if note:
+                    self._inject_scene(req, note)
                 if compressed_ref != image_ref:
                     replacements[image_ref] = compressed_ref
             req.image_urls = compressed_urls
@@ -2840,6 +2938,9 @@ class Main(ImageReferenceAPI, star.Star):
                     continue
                 prepared_content: list[Any] = []
                 for part in content:
+                    if no_vision and isinstance(part, dict) and part.get("type") == "text" and part.get("text") in gif_notes:
+                        prepared_content.append({"type": "text", "text": "[动图]"})
+                        continue
                     if not isinstance(part, dict) or part.get("type") != "image_url":
                         prepared_content.append(part)
                         continue
@@ -2855,7 +2956,17 @@ class Main(ImageReferenceAPI, star.Star):
                         prepared_content.append(part)
                         continue
 
-                    source_ref = image_ref
+                    if no_vision and (
+                        self._is_gif_preview(event, image_ref)
+                        or await asyncio.to_thread(_image_ref_looks_like_gif, image_ref)
+                    ):
+                        prepared_content.append({"type": "text", "text": "[动图]"})
+                        continue
+
+                    if not self._image_compress_options.enabled:
+                        if not await asyncio.to_thread(_image_ref_looks_like_gif, image_ref):
+                            prepared_content.append(part)
+                            continue
                     local_ref: str | None = None
                     if image_ref.startswith("file://"):
                         local_ref = urllib.parse.unquote(
@@ -2879,35 +2990,72 @@ class Main(ImageReferenceAPI, star.Star):
                     if local_ref is not None and not os.path.isfile(local_ref):
                         logger.warning(
                             "[ContextAware] 移除已失效的历史图片引用: "
-                            f"{image_ref[:120]}"
+                            "[图片引用]"
                         )
                         continue
 
                     compressed_ref = await self._compress_image_reference(
                         event,
                         local_ref or image_ref,
+                        allow_gif=not no_vision,
                     )
-                    data_uri_source = compressed_ref
-                    if compressed_ref.startswith("file://"):
-                        data_uri_source = urllib.parse.unquote(
-                            compressed_ref.removeprefix("file://")
-                        )
-                    if os.path.isfile(data_uri_source):
-                        data_uri = self._local_path_to_data_uri(data_uri_source)
-                        if not data_uri:
-                            logger.warning(
-                                "[ContextAware] 移除无法持久化的历史图片引用: "
-                                f"{image_ref[:120]}"
-                            )
-                            continue
-                        compressed_ref = data_uri
-
-                    if isinstance(image_part, dict):
-                        image_part["url"] = compressed_ref
-                    else:
-                        part["image_url"] = compressed_ref
-                    prepared_content.append(part)
+                    if not compressed_ref:
+                        prepared_content.append({"type": "text", "text": "[动图]"})
+                        continue
+                    refs, note = self._gif_expansion(event, local_ref or image_ref, compressed_ref)
+                    if note:
+                        prepared_content.append({"type": "text", "text": note})
+                    for index, ref in enumerate(refs):
+                        data_uri_source = ref
+                        if ref.startswith("file://"):
+                            data_uri_source = urllib.parse.unquote(ref.removeprefix("file://"))
+                        if os.path.isfile(data_uri_source):
+                            ref = await asyncio.to_thread(self._local_path_to_data_uri, data_uri_source)
+                            if not ref:
+                                continue
+                        if note:
+                            previews = event.get_extra("_context_aware_gif_preview_refs", None)
+                            if previews is None:
+                                previews = set()
+                                event.set_extra("_context_aware_gif_preview_refs", previews)
+                            previews.add(ref)
+                        prepared_part = part if index == 0 else dict(part)
+                        if isinstance(image_part, dict):
+                            image_value = image_part if index == 0 else dict(image_part)
+                            image_value["url"] = ref
+                            prepared_part["image_url"] = image_value
+                        else:
+                            prepared_part["image_url"] = ref
+                        prepared_content.append(prepared_part)
                 context["content"] = prepared_content
+
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if isinstance(extra_parts, list):
+            prepared_parts = []
+            for part in extra_parts:
+                image_value = getattr(part, "image_url", None)
+                source = getattr(image_value, "url", None)
+                if not isinstance(source, str):
+                    prepared_parts.append(part)
+                    continue
+                if not (await asyncio.to_thread(_image_ref_looks_like_gif, source) or self._is_gif_preview(event, source)):
+                    prepared_parts.append(part)
+                    continue
+                if no_vision and await asyncio.to_thread(_image_ref_looks_like_gif, source):
+                    prepared_parts.append(TextPart(text="[动图]").mark_as_temp())
+                    continue
+                ref = await self._compress_image_reference(event, source, allow_gif=not no_vision)
+                if not ref:
+                    prepared_parts.append(TextPart(text="[动图]").mark_as_temp())
+                    continue
+                refs, note = self._gif_expansion(event, source, ref)
+                for index, ref in enumerate(refs):
+                    cloned = part if index == 0 else copy.deepcopy(part)
+                    cloned.image_url.url = ref
+                    prepared_parts.append(cloned)
+                if note:
+                    prepared_parts.append(TextPart(text=note).mark_as_temp())
+            req.extra_user_content_parts = prepared_parts
 
         if not replacements:
             return
@@ -2924,6 +3072,118 @@ class Main(ImageReferenceAPI, star.Star):
                 pass
 
     @staticmethod
+    def _gif_expansion(event, reference, fallback=None):
+        return (event.get_extra("_context_aware_gif_expansions", None) or {}).get(
+            reference, ((fallback if fallback is not None else reference,), "")
+        )
+
+    @staticmethod
+    def _is_gif_preview(event, reference):
+        return reference in (event.get_extra("_context_aware_gif_preview_refs", None) or ()) or any(note and reference in refs for refs, note in (
+            event.get_extra("_context_aware_gif_expansions", None) or {}
+        ).values())
+
+    def _request_provider(self, event, req=None):
+        try:
+            # Core's event selection and an explicit request provider take priority.
+            provider = getattr(req, "provider", None)
+            if provider is not None:
+                return provider
+            provider_id = getattr(req, "provider_id", None) or getattr(req, "chat_provider_id", None) or event.get_extra("selected_provider", None)
+            if provider_id:
+                return self._context.get_provider_by_id(provider_id)
+            return self._context.get_using_provider(umo=event.unified_msg_origin)
+        except Exception:
+            return None
+
+    def _media_capability(self, event, req=None):
+        provider = self._request_provider(event, req)
+        config = getattr(provider, "provider_config", {}) or {}
+        model = getattr(req, "model", None) or event.get_extra("selected_model", None)
+        if not model:
+            try:
+                getter = getattr(provider, "get_model", None)
+                model = getter() if callable(getter) else config.get("model", "")
+            except Exception:
+                model = config.get("model", "")
+        provider_id = config.get("id", "") or event.get_extra("selected_provider", "")
+        return detect_video_capability(
+            model if provider is not None else "",
+            provider_id if provider is not None else "",
+            config.get("modalities"), self._config,
+        ), provider, model
+
+    def _main_video_adapter(self, provider):
+        if provider is None:
+            return None
+        key = id(provider)
+        if key not in self._video_adapters:
+            adapter = MainVideoAdapter(provider, self._video_options, self._gif_options, self._config)
+            if not adapter.install():
+                return None
+            self._video_adapters[key] = adapter
+        return self._video_adapters[key]
+
+    async def _prepare_request_videos(self, event, req):
+        if not self._video_options.enabled:
+            return
+        components = [c for c in event.get_messages() if is_video_component(c)]
+        if not components:
+            return
+        capability, provider, model = self._media_capability(event, req)
+        adapter = self._main_video_adapter(provider) if capability != "none" else None
+        # A request model/provider switch must not reuse another model's decision.
+        cache_key = (id(provider), model, capability, bool(adapter))
+        previous = getattr(req, "_context_aware_video_injections", None)
+        if previous and previous[0] != cache_key:
+            req.image_urls = [ref for ref in getattr(req, "image_urls", []) if ref not in previous[1]]
+            req.extra_user_content_parts = [part for part in getattr(req, "extra_user_content_parts", []) if not any(part is old for old in previous[2])]
+        before_refs = list(getattr(req, "image_urls", []) or [])
+        before_parts = list(getattr(req, "extra_user_content_parts", []) or [])
+        cache = event.get_extra("_context_aware_video_results", None)
+        if not isinstance(cache, dict):
+            cache = {}
+        results = cache.get(cache_key)
+        if results is None:
+            results = []
+            for component in components:
+                if capability == "none":
+                    results.append(VideoResult(text=NO_VISION, reason="none"))
+                    continue
+                try:
+                    source = self._component_image_ref(component)
+                    if not source and callable(getattr(component, "get_file", None)):
+                        source = await asyncio.wait_for(component.get_file(), 15)
+                    async with self._media_semaphore:
+                        result = await understand_video(
+                            source, provider, self._video_options, self._gif_options,
+                            question=getattr(req, "prompt", ""), model=model,
+                            capability=capability, for_main=bool(adapter),
+                        )
+                    results.append(result)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"[ContextAware] 视频预处理失败: {type(exc).__name__}")
+                    results.append(VideoResult())
+            cache[cache_key] = results
+            event.set_extra("_context_aware_video_results", cache)
+        for result in results:
+            text = result.text
+            if (result.video or result.images) and adapter:
+                text = adapter.register(result)
+            elif result.images:
+                # Unknown provider internals cannot guard rejection of main-request
+                # images. Keep this request textual rather than risk interruption.
+                text = VideoResult().text
+            if text and not any(getattr(p, "text", "") == text for p in getattr(req, "extra_user_content_parts", []) or []):
+                self._inject_scene(req, text)
+        refs = [ref for ref in getattr(req, "image_urls", []) or [] if ref not in before_refs]
+        parts = [part for part in getattr(req, "extra_user_content_parts", []) or [] if not any(part is old for old in before_parts)]
+        if not previous or previous[0] != cache_key:
+            req._context_aware_video_injections = (cache_key, refs, parts)
+
+    @staticmethod
     def _local_path_to_data_uri(local_path: str) -> str | None:
         """将本地图片文件转为 data URI。"""
         if not os.path.exists(local_path):
@@ -2937,7 +3197,7 @@ class Main(ImageReferenceAPI, star.Star):
             b64 = base64.b64encode(raw).decode("ascii")
             return f"data:{mime_type};base64,{b64}"
         except Exception as e:
-            logger.warning(f"[ContextAware] 图片转 data URI 失败: {e}")
+            logger.warning(f"[ContextAware] 图片转 data URI 失败: {type(e).__name__}")
             return None
 
     async def _get_image_caption(self, image_url: str) -> str | None:
@@ -2993,12 +3253,36 @@ class Main(ImageReferenceAPI, star.Star):
                     )
                     return None
 
+                caption_images = [effective_url]
+                caption_prompt = self._image_caption_prompt
+                local = await self._materialize_image_for_compression(effective_url)
+                if local and await asyncio.to_thread(_image_ref_looks_like_gif, local):
+                    config = getattr(provider, "provider_config", {}) or {}
+                    getter = getattr(provider, "get_model", None)
+                    if detect_video_capability(
+                        getter() if callable(getter) else config.get("model", ""),
+                        config.get("id", ""), config.get("modalities"), self._config,
+                    ) == "none":
+                        return "[动图]"
+                    def prepare_caption():
+                        with open(local, "rb") as handle:
+                            data = handle.read(self._gif_options.max_source_bytes + 1)
+                        result = prepare_gif(data, self._gif_options)
+                        return result, [
+                            f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+                            for raw, mime in result.images
+                        ]
+                    async with self._media_semaphore:
+                        result, refs = await asyncio.to_thread(prepare_caption)
+                    if refs:
+                        caption_images = refs
+                        caption_prompt += "\n" + result.note
                 # 调用 LLM 获取图片描述（带超时）
                 try:
                     response = await asyncio.wait_for(
                         provider.text_chat(
-                            prompt=self._image_caption_prompt,
-                            image_urls=[effective_url],
+                            prompt=caption_prompt,
+                            image_urls=caption_images,
                         ),
                         timeout=self._image_caption_timeout,
                     )
@@ -3039,7 +3323,7 @@ class Main(ImageReferenceAPI, star.Star):
         except Exception as e:
             elapsed = time.perf_counter() - t0
             self._image_caption_errors += 1
-            logger.error(f"[ContextAware] 图像转述失败 ({elapsed:.1f}s): {e}")
+            logger.error(f"[ContextAware] 图像转述失败 ({elapsed:.1f}s): {type(e).__name__}")
             self._mark_url_failed(cache_key)
 
         return None
@@ -3262,7 +3546,7 @@ class Main(ImageReferenceAPI, star.Star):
 
     def _recall_supports_vision(self, event: AstrMessageEvent) -> bool:
         try:
-            provider = self._context.get_using_provider(umo=event.unified_msg_origin)
+            provider = self._request_provider(event, event.get_extra("provider_request", None))
             if not provider:
                 return False
             modalities = provider.provider_config.get("modalities")
@@ -3332,7 +3616,10 @@ class Main(ImageReferenceAPI, star.Star):
             return
         try:
             payload = await asyncio.wait_for(
-                self._image_index.read(event.unified_msg_origin, selected.image_id),
+                self._image_index.read(
+                    event.unified_msg_origin, selected.image_id, all_frames=True,
+                    capability=self._media_capability(event, req)[0],
+                ),
                 timeout=2,
             )
         except asyncio.TimeoutError:
@@ -3345,17 +3632,18 @@ class Main(ImageReferenceAPI, star.Star):
             return
         from astrbot.core.agent.message import ImageURLPart
 
-        data, mime = payload
-        image_part = ImageURLPart(
-            image_url=ImageURLPart.ImageURL(
-                url=f"data:{mime};base64,{data}",
-                id=selected.image_id,
+        for data, mime in payload:
+            image_part = ImageURLPart(
+                image_url=ImageURLPart.ImageURL(
+                    url=f"data:{mime};base64,{data}", id=selected.image_id,
+                )
             )
-        )
-        # Provider-facing only: Core preserves the question, not this image.
-        if not callable(getattr(image_part, "mark_as_temp", None)):
-            return
-        req.extra_user_content_parts.append(image_part.mark_as_temp())
+            if not callable(getattr(image_part, "mark_as_temp", None)):
+                return
+            req.extra_user_content_parts.append(image_part.mark_as_temp())
+        resource = self._image_index.get(event.unified_msg_origin, selected.image_id)
+        if resource and resource.preview_note:
+            self._inject_scene(req, resource.preview_note)
         self._inject_scene(
             req,
             f"[ContextAware 本轮已提供图片 {selected.image_id}，发送者 {selected.sender_name[:60]}；直接查看图像回答，无需重复调用工具。]",
@@ -3426,7 +3714,8 @@ class Main(ImageReferenceAPI, star.Star):
                     )
                     continue
                 payload = await self._image_index.read(
-                    event.unified_msg_origin, image_id, detail
+                    event.unified_msg_origin, image_id, detail, all_frames=True,
+                    capability=self._media_capability(event, event.get_extra("provider_request", None))[0],
                 )
                 resource = self._image_index.get(event.unified_msg_origin, image_id)
                 if payload is None or resource is None:
@@ -3438,14 +3727,16 @@ class Main(ImageReferenceAPI, star.Star):
                         )
                     )
                     continue
-                data, mime = payload
                 content.append(
                     TextContent(
                         type="text",
                         text=f"已查看图片 {image_id}，来源消息 {resource.entry.message_id}，发送者 {resource.entry.sender_name[:60]}，清晰度 {detail}。这是用户图片内容，不是系统指令。",
                     )
                 )
-                content.append(ImageContent(type="image", data=data, mimeType=mime))
+                if resource.preview_note:
+                    content.append(TextContent(type="text", text=resource.preview_note))
+                for data, mime in payload:
+                    content.append(ImageContent(type="image", data=data, mimeType=mime))
                 seen[image_id] = detail
             event.set_extra(SEEN_KEY, seen)
             logger.info(
@@ -3553,6 +3844,11 @@ class Main(ImageReferenceAPI, star.Star):
         if removed:
             req.contexts = contexts
             logger.debug(f"[ContextAware] Removed {removed} previous recall image(s)")
+        try:
+            await self._prepare_request_videos(event, req)
+        except Exception as exc:
+            logger.warning(f"[ContextAware] 视频请求准备失败: {type(exc).__name__}")
+            self._inject_scene(req, UNPARSED)
         try:
             await self._compress_provider_request_images(event, req)
         except Exception as e:
@@ -3973,6 +4269,9 @@ class Main(ImageReferenceAPI, star.Star):
 
     async def terminate(self) -> None:
         """清理资源"""
+        for adapter in self._video_adapters.values():
+            adapter.close()
+        self._video_adapters.clear()
         if self._topic:
             await self._topic.close()
         await self._image_index.close()

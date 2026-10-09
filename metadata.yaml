@@ -9,6 +9,7 @@ help: |
 
   图片与语音上下文
   - 支持近期图片索引、按需回看、图片压缩和已有语音转写的上下文补充。
+  - GIF 默认以带序号的多帧网格理解；视频理解可选开启，失败时自动抽帧。
   - 图片回看需要模型支持相应能力，具体要求见 README。
 
   私聊上下文
@@ -22,7 +23,7 @@ help: |
   - 可独立使用，无需安装其他长期记忆插件。
 
   完整功能、配置与兼容性说明见 README。
-version: 3.7.1
+version: 3.8.0
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.26.8"

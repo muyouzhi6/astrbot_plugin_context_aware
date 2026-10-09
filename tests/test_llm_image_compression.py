@@ -108,7 +108,7 @@ class ImageCompressionCoreTest(unittest.TestCase):
                 self.assertIn("A", compressed.mode)
                 self.assertLessEqual(max(compressed.size), 700)
 
-    def test_gif_is_converted_to_first_frame_png(self):
+    def test_gif_is_converted_to_numbered_grid_png(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "animated.gif"
             frames = [
@@ -132,13 +132,13 @@ class ImageCompressionCoreTest(unittest.TestCase):
             outcome = compress_local_image(str(source), root, options)
 
             self.assertTrue(outcome.changed)
-            self.assertEqual(outcome.reason, "gif_first_frame")
+            self.assertEqual(outcome.reason, "gif_grid")
             self.assertTrue(outcome.output_path.endswith(".png"))
             with Image.open(outcome.output_path) as converted:
                 self.assertEqual(converted.format, "PNG")
                 self.assertEqual(getattr(converted, "n_frames", 1), 1)
                 self.assertEqual(
-                    converted.convert("RGB").getpixel((0, 0)),
+                    converted.convert("RGB").getpixel((10, 30)),
                     (255, 0, 0),
                 )
 
@@ -155,7 +155,7 @@ class ImageCompressionCoreTest(unittest.TestCase):
             outcome = compress_local_image(str(source), root, options)
 
             self.assertTrue(outcome.changed)
-            self.assertEqual(outcome.reason, "gif_first_frame")
+            self.assertEqual(outcome.reason, "gif_static")
             self.assertTrue(outcome.output_path.endswith(".png"))
 
     def test_source_over_input_limit_is_left_unchanged(self):
@@ -796,3 +796,281 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GifRequestIntegrationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_no_vision_drops_gif_current_history_and_extra_without_sampling(self):
+        from test_gif_frames import gif_bytes
+        from unittest.mock import AsyncMock
+        with tempfile.TemporaryDirectory() as root:
+            mod = load_plugin_module()
+            plugin = mod.Main(FakeContext(), {"enable": False, "image_cache_dir": root})
+            provider = types.SimpleNamespace(provider_config={"id": "text-provider", "modalities": ["text", "tool_use"]}, get_model=lambda: "gemini-3-flash")
+            plugin._context.get_using_provider = lambda **kwargs: provider
+            source = Path(root) / "animation.data"
+            source.write_bytes(gif_bytes())
+            static = Path(root) / "ordinary.png"
+            with Image.new("RGB", (20, 20), "red") as image:
+                image.save(static)
+            event = FakeCompressionEvent()
+            req = types.SimpleNamespace(
+                image_urls=[str(source), str(static)],
+                extra_user_content_parts=[types.SimpleNamespace(image_url=types.SimpleNamespace(url=str(source)))],
+                contexts=[{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": str(source)}},
+                    {"type": "image_url", "image_url": {"url": str(static)}},
+                ]}],
+            )
+            try:
+                with patch.object(mod, "compress_local_image", side_effect=AssertionError), patch.object(mod, "prepare_gif", side_effect=AssertionError):
+                    await plugin.on_llm_request(event, req)
+                self.assertEqual(req.image_urls, [str(static)])
+                self.assertEqual(req.contexts[0]["content"][0], {"type": "text", "text": "[动图]"})
+                self.assertEqual(req.contexts[0]["content"][1]["image_url"]["url"], str(static))
+                self.assertTrue(all(not hasattr(p, "image_url") for p in req.extra_user_content_parts))
+                self.assertFalse(event.tracked)
+                self.assertEqual(source.read_bytes(), gif_bytes())
+                # Extension-based GIFs do not even materialize a remote source.
+                req.image_urls = ["https://example.com/animation.gif"]
+                req.contexts = []
+                with patch.object(plugin, "_materialize_image_for_compression", new=AsyncMock(side_effect=AssertionError)):
+                    await plugin._compress_provider_request_images(event, req)
+                self.assertEqual(req.image_urls, [])
+            finally:
+                await plugin.terminate()
+
+    async def test_default_grid_without_static_compression_and_unchanged_png(self):
+        from test_gif_frames import gif_bytes
+        with tempfile.TemporaryDirectory() as root:
+            mod = load_plugin_module()
+            plugin = mod.Main(FakeContext(), {"enable": False, "image_cache_dir": root})
+            plugin._image_compress_output_dir = root
+            source = Path(root) / "animation.data"
+            source.write_bytes(gif_bytes())
+            static = Path(root) / "static.png"
+            with Image.new("RGB", (32, 24), "red") as image:
+                image.save(static)
+            event = FakeCompressionEvent(private=True)
+            req = types.SimpleNamespace(image_urls=[str(source), str(static)], extra_user_content_parts=[])
+            try:
+                await plugin.on_llm_request(event, req)
+                self.assertNotEqual(req.image_urls[0], str(source))
+                self.assertEqual(req.image_urls[1], str(static))
+                self.assertTrue(any("3帧" in p.text for p in req.extra_user_content_parts))
+                with Image.open(req.image_urls[0]) as image:
+                    self.assertEqual(image.getpixel((74, 30)), (0, 128, 0))
+                self.assertEqual(source.read_bytes(), gif_bytes())
+            finally:
+                await plugin.terminate()
+
+    async def test_switch_to_text_model_removes_previously_prepared_gif_frames(self):
+        from test_gif_frames import gif_bytes
+        with tempfile.TemporaryDirectory() as root:
+            mod = load_plugin_module()
+            plugin = mod.Main(FakeContext(), {"enable": False, "image_cache_dir": root, "gif_mode": "frames"})
+            plugin._image_compress_output_dir = root
+            provider = types.SimpleNamespace(provider_config={"modalities": ["text", "image"]}, get_model=lambda: "gpt-4o")
+            plugin._context.get_using_provider = lambda **kwargs: provider
+            source = Path(root) / "animation.gif"
+            source.write_bytes(gif_bytes())
+            event = FakeCompressionEvent()
+            req = types.SimpleNamespace(
+                image_urls=[str(source)],
+                extra_user_content_parts=[types.SimpleNamespace(image_url=types.SimpleNamespace(url=str(source)))],
+                contexts=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": str(source)}}]}],
+            )
+            try:
+                await plugin._compress_provider_request_images(event, req)
+                self.assertEqual(len(req.image_urls), 3)
+                provider.provider_config["modalities"] = ["text"]
+                with patch.object(mod, "compress_local_image", side_effect=AssertionError):
+                    await plugin._compress_provider_request_images(event, req)
+                self.assertEqual(req.image_urls, [])
+                self.assertTrue(all(p.text == "[动图]" for p in req.extra_user_content_parts))
+                self.assertTrue(all(p["type"] == "text" and p["text"] == "[动图]" for p in req.contexts[0]["content"]))
+            finally:
+                await plugin.terminate()
+
+    async def test_frames_expand_current_history_and_extra_parts_once(self):
+        from test_gif_frames import gif_bytes
+        with tempfile.TemporaryDirectory() as root:
+            mod = load_plugin_module()
+            plugin = mod.Main(FakeContext(), {"enable": False, "gif_mode": "frames", "image_cache_dir": root})
+            plugin._image_compress_output_dir = root
+            source = Path(root) / "animation.gif"
+            source.write_bytes(gif_bytes())
+            event = FakeCompressionEvent(private=True)
+            part = types.SimpleNamespace(image_url=types.SimpleNamespace(url=str(source)), type="image_url")
+            req = types.SimpleNamespace(
+                image_urls=[str(source)], extra_user_content_parts=[part],
+                contexts=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": str(source), "detail": "high"}}]}],
+            )
+            try:
+                await plugin._compress_provider_request_images(event, req)
+                self.assertEqual(len(req.image_urls), 3)
+                self.assertEqual(len(event.tracked), 3)
+                image_parts = [p for p in req.contexts[0]["content"] if p["type"] == "image_url"]
+                self.assertEqual(len(image_parts), 3)
+                self.assertTrue(all(p["image_url"]["url"].startswith("data:image/") for p in image_parts))
+                self.assertTrue(all(p["image_url"]["detail"] == "high" for p in image_parts))
+                self.assertEqual(len([p for p in req.extra_user_content_parts if hasattr(p, "image_url")]), 3)
+                await plugin._compress_provider_request_images(event, req)
+                self.assertEqual(len(req.image_urls), 3)
+                self.assertEqual(len(event.tracked), 3)
+                self.assertEqual(plugin._image_compress_count, 1)
+            finally:
+                await plugin.terminate()
+
+    async def test_lazy_caption_gets_all_frames_without_changing_markers(self):
+        from unittest.mock import AsyncMock
+        from test_gif_frames import gif_bytes
+        with tempfile.TemporaryDirectory() as root:
+            mod = load_plugin_module()
+            plugin = mod.Main(FakeContext(), {
+                "enable": False, "image_cache_dir": root, "image_caption": True,
+                "image_caption_lazy": True, "show_recent_images_allow_gif": True, "gif_mode": "frames",
+            })
+            source = Path(root) / "caption.gif"
+            source.write_bytes(gif_bytes())
+            provider = types.SimpleNamespace(text_chat=AsyncMock(return_value=types.SimpleNamespace(completion_text="颜色依次变换")))
+            plugin._context.get_using_provider = lambda: provider
+            record = mod.MessageRecord(msg_id="gif", sender_id="a", sender_name="A", content="[图片] [图片]", timestamp=1, image_urls=[str(source), str(source)], has_image=True, image_count=2, has_gif=True, gif_count=2)
+            try:
+                with patch.object(mod, "Provider", types.SimpleNamespace):
+                    result = await plugin._lazy_caption_flow([record])
+                self.assertEqual(result[0].content.count("[图片: 颜色依次变换]"), 2)
+                self.assertEqual(len(provider.text_chat.call_args.kwargs["image_urls"]), 3)
+                self.assertIn("3帧", provider.text_chat.call_args.kwargs["prompt"])
+                self.assertEqual(provider.text_chat.await_count, 1)
+            finally:
+                await plugin.terminate()
+
+    async def test_component_and_reference_original_survive_normalization(self):
+        from test_gif_frames import gif_bytes
+        with tempfile.TemporaryDirectory() as root:
+            mod = load_plugin_module()
+            plugin = mod.Main(FakeContext(), {"image_cache_dir": root, "llm_image_compress": {"enable": True}})
+            plugin._image_compress_output_dir = root
+            path = Path(root) / "original.gif"
+            raw = gif_bytes()
+            path.write_bytes(raw)
+            component = mod.Image.fromFileSystem(str(path))
+            event = FakeCompressionEvent(private=True)
+            event.get_messages = lambda: [component]
+            before = plugin._component_image_ref(component)
+            try:
+                await plugin._prepare_event_images_for_llm(event)
+                self.assertEqual(plugin._component_image_ref(component), before)
+                req = types.SimpleNamespace(image_urls=[before], extra_user_content_parts=[])
+                await plugin._compress_provider_request_images(event, req)
+                self.assertNotEqual(req.image_urls[0], before)
+                self.assertEqual(path.read_bytes(), raw)
+            finally:
+                await plugin.terminate()
+
+
+class StrictReviewRegressionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_static_paths_do_not_materialize_or_change_references(self):
+        from unittest.mock import AsyncMock
+        import copy
+
+        mod = load_plugin_module()
+        with tempfile.TemporaryDirectory() as root:
+            plugin = mod.Main(FakeContext(), {"enable": False, "image_cache_dir": root})
+            local = Path(root) / "static.png"
+            with Image.new("RGB", (8, 8), "red") as image:
+                image.save(local)
+            refs = ["https://example.com/image.png", "https://example.com/opaque", str(local),
+                    local.as_uri(), "data:image/png;base64," + base64.b64encode(local.read_bytes()).decode(),
+                    "base64://" + base64.b64encode(local.read_bytes()).decode(), str(Path(root) / "missing.jpg")]
+            parts = [types.SimpleNamespace(image_url=types.SimpleNamespace(url=ref)) for ref in refs]
+            history = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": ref, "detail": "high"}} for ref in refs]}]
+            req = types.SimpleNamespace(image_urls=refs[:], contexts=copy.deepcopy(history), extra_user_content_parts=parts)
+            event = FakeCompressionEvent()
+            event.get_messages = lambda: [mod.Image(url=ref) for ref in refs]
+            try:
+                with patch.object(plugin, "_materialize_image_for_compression", new_callable=AsyncMock) as fetch:
+                    await plugin._prepare_event_images_for_llm(event)
+                    await plugin._compress_provider_request_images(event, req)
+                fetch.assert_not_awaited()
+                self.assertEqual(req.image_urls, refs)
+                self.assertEqual(req.contexts, history)
+                self.assertEqual([p.image_url.url for p in parts], refs)
+                self.assertEqual(event.tracked, [])
+            finally:
+                await plugin.terminate()
+
+    async def test_uncompressed_download_is_reused_in_current_and_history(self):
+        from unittest.mock import AsyncMock
+
+        mod = load_plugin_module()
+        with tempfile.TemporaryDirectory() as root:
+            local = Path(root) / "small.png"
+            with Image.new("RGB", (8, 8), "red") as image:
+                image.save(local)
+            plugin = mod.Main(FakeContext(), {"enable": False, "image_cache_dir": root, "llm_image_compress": {"enable": True}})
+            plugin._context.get_using_provider = lambda **kw: types.SimpleNamespace(
+                provider_config={"modalities": ["text"]}, get_model=lambda: "text-model",
+            )
+            remote = "https://example.com/signed-image.png"
+            extra = types.SimpleNamespace(image_url=types.SimpleNamespace(url=remote))
+            req = types.SimpleNamespace(image_urls=[remote], contexts=[{"role": "user", "content": [{"type": "image_url", "image_url": {"url": remote, "detail": "high"}}]}], extra_user_content_parts=[extra])
+            try:
+                with patch.object(plugin, "_download_image_to_local", AsyncMock(return_value=str(local))) as fetch:
+                    await plugin._compress_provider_request_images(FakeCompressionEvent(), req)
+                fetch.assert_awaited_once()
+                self.assertEqual(req.image_urls, [str(local)])
+                part = req.contexts[0]["content"][0]["image_url"]
+                self.assertEqual(base64.b64decode(part["url"].split(",", 1)[1]), local.read_bytes())
+                self.assertEqual(part["detail"], "high")
+                self.assertEqual(extra.image_url.url, remote)  # 3.7.1 does not alter extra static ImageURLParts.
+            finally:
+                await plugin.terminate()
+
+    async def test_cancel_survives_worker_and_cleanup_failures(self):
+        import asyncio
+        import threading
+
+        mod = load_plugin_module()
+        for failure in ("worker", "unlink", "tracking"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as root:
+                plugin = mod.Main(FakeContext(), {"image_cache_dir": root, "llm_image_compress": {"enable": True}})
+                source = Path(root) / "static.png"
+                source.write_bytes(b"static")
+                started, finish = threading.Event(), threading.Event()
+
+                def worker(*args):
+                    started.set()
+                    finish.wait(5)
+                    if failure == "worker":
+                        raise ValueError("worker failed")
+                    return types.SimpleNamespace(changed=True, output_paths=(str(Path(root) / "output.png"),))
+
+                event = FakeCompressionEvent()
+                try:
+                    with patch.object(mod, "compress_local_image", worker), patch.object(Path, "unlink", side_effect=OSError("cleanup failed")), patch.object(plugin, "_track_temporary_image", side_effect=RuntimeError if failure == "tracking" else None):
+                        task = asyncio.create_task(plugin._compress_image_reference(event, str(source)))
+                        self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                        task.cancel()
+                        finish.set()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                finally:
+                    finish.set()
+                    await plugin.terminate()
+
+    async def test_new_remote_gif_uses_checked_downloader(self):
+        from unittest.mock import AsyncMock
+        from test_gif_frames import gif_bytes
+
+        mod = load_plugin_module()
+        with tempfile.TemporaryDirectory() as root:
+            plugin = mod.Main(FakeContext(), {"image_cache_dir": root})
+            plugin._image_compress_output_dir = root
+            try:
+                with patch.object(mod.ImageIndex, "_fetch", AsyncMock(return_value=gif_bytes())) as fetch, patch.object(plugin, "_download_image_to_local", side_effect=AssertionError("legacy downloader")):
+                    ref = await plugin._compress_image_reference(FakeCompressionEvent(), "https://example.com/animated.gif")
+                fetch.assert_awaited_once_with("https://example.com/animated.gif")
+                self.assertTrue(Path(ref).is_file())
+            finally:
+                await plugin.terminate()

@@ -19,6 +19,11 @@ from urllib.parse import unquote, urlsplit
 
 from PIL import Image, ImageOps
 
+try:
+    from .gif_frames import GifOptions, prepare_gif
+except ImportError:
+    from gif_frames import GifOptions, prepare_gif
+
 TOOL_NAME = "context_aware_view_images"
 SNAPSHOT_KEY = "_context_aware_image_snapshot"
 SEQUENCE_KEY = "_context_aware_image_sequence"
@@ -52,6 +57,7 @@ class _Resource:
     source: str
     data: bytes = b""
     retry_at: float = 0
+    preview_note: str = ""
 
     @property
     def cost(self) -> int:
@@ -75,7 +81,9 @@ class ImageIndex:
         max_sessions=100,
         budget_bytes=64 * MIB,
         max_download_bytes=20 * MIB,
+        gif_options=None,
     ):
+        self.gif_options = gif_options or GifOptions()
         self.ttl = max(60, min(int(ttl), 86400))
         self.per_session = max(1, min(int(per_session), 100))
         self.max_sessions = max(1, min(int(max_sessions), 1000))
@@ -336,26 +344,41 @@ class ImageIndex:
             return None
         return resource.data
 
-    async def read(self, session, image_id, detail="auto"):
+    async def read(self, session, image_id, detail="auto", *, all_frames=False, capability="frames"):
         data = await self.read_bytes(session, image_id)
         resource = self.get(session, image_id)
         if data is None or resource is None:
             return None
+        if capability == "none" and data.startswith((b"GIF87a", b"GIF89a")):
+            resource.preview_note = "[动图]"
+            return None
         try:
             async with self.semaphore:
-                result = await asyncio.to_thread(encode_image, data, detail)
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(encode_image, data, detail, self.gif_options, all_frames, True),
+                    timeout=self.gif_options.timeout_sec * 2 + 1,
+                )
         except Exception:
             return None
-        return result if self.get(session, image_id) is resource else None
+        if self.get(session, image_id) is not resource:
+            return None
+        payload, resource.preview_note = result
+        return payload
 
     async def _fetch(self, source):
         if source.startswith(("data:", "base64://")):
-            payload = (
-                source.split(",", 1)[1] if source.startswith("data:") else source[9:]
-            )
-            if len(payload) > (self.max_download + 2) * 4 // 3 + 4:
-                raise ValueError("image exceeds download limit")
-            data = base64.b64decode(payload, validate=True)
+            def decode_inline():
+                # Splitting a large URI also copies memory; keep both operations
+                # off the loop, including video reuse of this bounded reader.
+                payload = source.split(",", 1)[1] if source.startswith("data:") else source[9:]
+                if len(payload) > (self.max_download + 2) * 4 // 3 + 4:
+                    raise ValueError("image exceeds download limit")
+                decoded = base64.b64decode(payload, validate=True)
+                if len(decoded) > self.max_download:
+                    raise ValueError("image exceeds download limit")
+                return decoded
+
+            data = await asyncio.to_thread(decode_inline)
         elif source.startswith(("http://", "https://")):
             import aiohttp
             from aiohttp.resolver import DefaultResolver
@@ -397,6 +420,8 @@ class ImageIndex:
                             url = urljoin(url, response.headers["Location"])
                             continue
                         response.raise_for_status()
+                        if response.content_length is not None and response.content_length > self.max_download:
+                            raise ValueError("image exceeds download limit")
                         data = bytearray()
                         async for chunk in response.content.iter_chunked(65536):
                             data.extend(chunk)
@@ -439,7 +464,21 @@ def validate_image(data):
         image.verify()
 
 
-def encode_image(data, detail):
+def encode_image(data, detail, gif_options=None, all_frames=False, with_note=False):
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        result = prepare_gif(data, gif_options or GifOptions())
+        if not result.images:
+            raise ValueError("GIF preview unavailable")
+        if result.animated:
+            payloads = [(base64.b64encode(raw).decode("ascii"), mime) for raw, mime in result.images]
+            payload = payloads if all_frames else payloads[0]
+            return (payload, result.note) if with_note else payload
+    result = _encode_static_image(data, detail)
+    payload = [result] if all_frames else result
+    return (payload, "") if with_note else payload
+
+
+def _encode_static_image(data, detail):
     with Image.open(io.BytesIO(data)) as image:
         image.seek(0)
         image = ImageOps.exif_transpose(image).convert("RGBA")
