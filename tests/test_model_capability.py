@@ -28,7 +28,7 @@ def test_native_names_and_provider_ids(name, family):
     ("gpt-4o", ["image"], "frames"),
     ("gpt-4o", ["text"], "none"),
     ("gemini-3-flash", [], "none"),
-    ("gemini-3-flash", ["video"], "none"),
+    ("gemini-3-flash", ["video"], "native"),
     ("unknown", ["text", "image", "video"], "native"),
     ("unknown", None, "frames"), ("", None, "frames"),
     ("grok-vision", ["image"], "frames"),
@@ -72,3 +72,29 @@ def test_schema_retains_hidden_legacy_key_during_default_merge():
     config = {key: value.get("default") for key, value in schema.items()}
     config["video_mode"] = "frames"
     assert detect_video_capability("gemini-3-flash", modalities=["image"], config=config) == "frames"
+
+
+def test_video_panel_exposes_three_simple_defaults_and_keeps_legacy_keys():
+    schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())
+    visible = {key for key, item in schema.items() if key.startswith("video_") and not item.get("invisible")}
+    assert visible == {"video_understanding_enabled", "video_max_duration_sec", "video_audio_transcribe"}
+    assert schema["video_understanding_enabled"]["default"] is True
+    assert schema["video_max_duration_sec"]["default"] == 120
+    assert schema["video_audio_transcribe"]["default"] == "auto"
+    assert schema["video_audio_transcribe"]["options"] == ["auto", "off"]
+    config = {key: value.get("default") for key, value in schema.items()}
+    assert detect_video_capability("gemini-3-flash", modalities=["image"], config=config) == "native"
+    assert detect_video_capability("gpt-4o", modalities=["image"], config=config) == "frames"
+    assert detect_video_capability("deepseek-chat", modalities=["text"], config=config) == "none"
+
+
+@pytest.mark.parametrize("model", ["gpt-4o", "claude-sonnet-4", "deepseek-chat", "qwen3-32b", "glm-4-plus"])
+def test_switching_away_from_video_model_does_not_inherit_provider_name(model):
+    assert video_family(model, "newapigemini") == ""
+    assert video_family("newapigemini/" + model, "newapigemini") == ""
+    assert detect_video_capability(model, "newapigemini", ["image"]) == "frames"
+
+
+@pytest.mark.parametrize("model", ["deepseek-chat", "qwen3-32b", "glm-4-plus", "llama-3.3-70b", "mistral-large"])
+def test_known_text_models_without_modalities_are_textual(model):
+    assert detect_video_capability(model, "newapigemini") == "none"

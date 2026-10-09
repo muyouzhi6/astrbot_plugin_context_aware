@@ -205,6 +205,32 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.mod = load_plugin_module()
 
+    async def test_nested_quoted_static_image_is_added_once_with_compression_off(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = Path(root) / "quoted.png"
+            image = Image.new("RGB", (32, 24), "red")
+            image.save(source, "PNG")
+            image.close()
+            plugin = self.mod.Main(FakeContext(), {
+                "enable": False, "image_cache_dir": str(Path(root) / "cache"),
+                "llm_image_compress": {"enable": False},
+            })
+            component = self.mod.Image.fromFileSystem(str(source))
+            inner, outer = self.mod.Reply(), self.mod.Reply()
+            inner.chain = [component, component]
+            outer.chain = [inner]
+            event = FakeCompressionEvent()
+            event.get_messages = lambda: [outer]
+            req = types.SimpleNamespace(image_urls=[], extra_user_content_parts=[])
+            try:
+                with patch.object(plugin, "_download_image_to_local", side_effect=AssertionError):
+                    await plugin.on_llm_request(event, req)
+                    await plugin.on_llm_request(event, req)
+                self.assertEqual(req.image_urls, [str(source)])
+                self.assertEqual(plugin._image_compress_count, 0)
+            finally:
+                await plugin.terminate()
+
     async def test_request_images_compress_even_when_context_feature_is_disabled(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / "request.jpg"
@@ -348,7 +374,7 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(
                             Path(promoted.path).resolve(), source.resolve()
                         )
-                        self.assertEqual(file_component.get_file_calls, 1)
+                        self.assertEqual(file_component.get_file_calls, 0)
             finally:
                 await plugin.terminate()
 
@@ -425,7 +451,7 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 await plugin.terminate()
 
             self.assertIsInstance(promoted, self.mod.Image)
-            self.assertEqual(file_component.get_file_calls, 1)
+            self.assertEqual(file_component.get_file_calls, 0)
             self.assertEqual(compress.call_count, 1)
             self.assertEqual(plugin._image_compress_count, 1)
 

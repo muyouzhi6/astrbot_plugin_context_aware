@@ -3,11 +3,52 @@ from __future__ import annotations
 import io
 from dataclasses import replace
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image, ImageDraw
 
 from gif_frames import GifOptions, prepare_gif, render_frames
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["image", "file"])
+@pytest.mark.parametrize("no_vision", [False, True])
+async def test_nested_quoted_gif_enters_request_without_core_image_urls(tmp_path, kind, no_vision):
+    from test_llm_image_compression import FakeCompressionEvent, FakeContext, load_plugin_module
+
+    module = load_plugin_module()
+    path = tmp_path / "quoted.gif"
+    path.write_bytes(gif_bytes())
+    plugin = module.Main(FakeContext(), {
+        "enable": False, "image_cache_dir": str(tmp_path / "cache"),
+        "gif_mode": "frames", "video_capability_override": "none" if no_vision else "frames",
+    })
+    plugin._image_compress_output_dir = str(tmp_path / "output")
+    component = module.File("quoted.gif", file=str(path)) if kind == "file" else module.Image.fromFileSystem(str(path))
+    inner, outer = module.Reply(), module.Reply()
+    inner.chain = [component]
+    outer.chain = [inner]
+    event = FakeCompressionEvent()
+    event.get_messages = lambda: [outer]
+    req = SimpleNamespace(image_urls=[], extra_user_content_parts=[])
+    try:
+        await plugin.on_llm_request(event, req)
+        if no_vision:
+            assert not req.image_urls
+            assert any(p.text == "[动图]" for p in req.extra_user_content_parts)
+        else:
+            assert len(req.image_urls) == 3
+            assert all(ref.endswith(".png") for ref in req.image_urls)
+            assert any("3帧" in p.text for p in req.extra_user_content_parts)
+            first = list(req.image_urls)
+            await plugin.on_llm_request(event, req)
+            assert req.image_urls == first
+        assert path.read_bytes().startswith(b"GIF")
+        if kind == "file":
+            assert component.get_file_calls == 0
+    finally:
+        await plugin.terminate()
 
 
 def gif_bytes(

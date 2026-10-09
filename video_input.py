@@ -8,6 +8,7 @@ import copy
 import json
 import math
 import mimetypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -15,6 +16,7 @@ import time
 import uuid
 import weakref
 from contextlib import AsyncExitStack, asynccontextmanager
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
@@ -49,7 +51,7 @@ VIDEO_SUFFIXES = {
 
 @dataclass(frozen=True)
 class VideoOptions:
-    enabled: bool = False
+    enabled: bool = True
     max_bytes: int = 50 * MIB
     max_duration_sec: float = 120
     mode: str = "auto"
@@ -57,6 +59,7 @@ class VideoOptions:
     inline_max_bytes: int = 12 * MIB
     timeout_sec: float = 60
     transcode: bool = False
+    audio_transcribe: str = "auto"
 
     @classmethod
     def from_mapping(cls, raw):
@@ -65,7 +68,7 @@ class VideoOptions:
         if mode == "auto" or mode not in ("auto", "native", "frames", "none"):
             mode = raw.get("video_mode", "auto")
         return cls(
-            enabled=raw.get("video_understanding_enabled", False) is True,
+            enabled=raw.get("video_understanding_enabled", True) is True,
             max_bytes=int(number(raw, "video_max_bytes", 50 * MIB, 1024, 200 * MIB)),
             max_duration_sec=number(raw, "video_max_duration_sec", 120, 1, 600),
             mode=mode if mode in ("auto", "native", "frames", "none") else "auto",
@@ -75,6 +78,7 @@ class VideoOptions:
             ),
             timeout_sec=number(raw, "video_timeout_sec", 60, 1, 180),
             transcode=raw.get("video_transcode", False) is True,
+            audio_transcribe="off" if raw.get("video_audio_transcribe") == "off" else "auto",
         )
 
 
@@ -86,7 +90,16 @@ class VideoResult:
     video: bytes = field(default=b"", repr=False)
     mime: str = "video/mp4"
     family: str = ""
+    origin: str = field(default="", repr=False)
+    transcript: str = field(default="", repr=False)
     token: str = field(default_factory=lambda: "[context-aware-video:" + uuid.uuid4().hex + "]")
+
+
+def _source_value(component, attr):
+    # AstrBot File.file is a property that can download synchronously.
+    if attr == "file" and type(component).__name__ == "File":
+        return getattr(component, "__dict__", {}).get("file", "")
+    return getattr(component, attr, "")
 
 
 def is_video_component(component):
@@ -97,10 +110,102 @@ def is_video_component(component):
     if str(getattr(component, "mime_type", "")).startswith("video/"):
         return True
     return any(
-        Path(urlsplit(str(getattr(component, attr, "") or "")).path).suffix.lower()
+        Path(urlsplit(str(_source_value(component, attr) or "")).path).suffix.lower()
         in VIDEO_SUFFIXES
-        for attr in ("name", "file", "url", "path")
+        for attr in ("name", "file", "file_", "url", "path")
     )
+
+
+def walk_message_chain(chain, *, max_depth=8, max_items=64):
+    """Yield mutable chain slots; cap work and tolerate cyclic Reply chains."""
+    seen = set()
+    remaining = max_items
+
+    def walk(items, depth):
+        nonlocal remaining
+        if not isinstance(items, (list, tuple)) or id(items) in seen or depth > max_depth:
+            return
+        seen.add(id(items))
+        for index, component in enumerate(items):
+            if remaining <= 0:
+                return
+            remaining -= 1
+            yield items, index, component
+            if type(component).__name__ == "Reply":
+                yield from walk(getattr(component, "chain", None), depth + 1)
+
+    yield from walk(chain, 0)
+
+
+def video_source(component):
+    """Prefer Core's local copy; never let a component downloader bypass checks."""
+    refs = [_source_value(component, attr) for attr in ("path", "file_", "file", "url")]
+    refs = [ref for ref in refs if isinstance(ref, str) and ref]
+    for ref in refs:
+        if urlsplit(ref).scheme not in ("", "file"):
+            continue
+        path = unquote(urlsplit(ref).path) if ref.startswith("file://") else ref
+        try:
+            if Path(path).is_file():
+                return path
+        except OSError:
+            pass
+    return next((ref for ref in refs if ref.startswith(("https://", "http://", "data:", "base64://"))), refs[0] if refs else "")
+
+
+def downloaded_video_paths(req, directory):
+    """Recognize Core-owned temp paths in its textual attachment notes."""
+    root = Path(directory).resolve()
+    texts = [getattr(req, "prompt", "")]
+    texts.extend(getattr(part, "text", "") for part in getattr(req, "extra_user_content_parts", []) or [])
+    paths = []
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for ref in re.findall(r"(?:file://)?/[^\s\"'<>\[\]]*media_video_[\w.-]+", text[:16000]):
+            path = Path(unquote(urlsplit(ref).path) if ref.startswith("file://") else ref)
+            try:
+                if (path.name.startswith("media_video_") and path.suffix.lower() in VIDEO_SUFFIXES
+                        and path.resolve().is_relative_to(root) and path.is_file()):
+                    local = str(path)
+                    if local not in paths:
+                        paths.append(local)
+            except OSError:
+                pass
+    return paths[:3]
+
+
+class RecentVideos:
+    """Keep references for five messages per session, never downloaded bytes."""
+
+    def __init__(self):
+        self.sessions = OrderedDict()
+
+    def record(self, origin, message_id, components, now=None):
+        now = time.monotonic() if now is None else now
+        self._expire(now)
+        messages = self.sessions.setdefault(origin, deque(maxlen=5))
+        if any(item[0] == message_id for item in messages):
+            return
+        videos = tuple(c for c in components[:64] if is_video_component(c))[:3]
+        messages.append((message_id, now, videos))
+        self.sessions.move_to_end(origin)
+        while len(self.sessions) > 256:
+            self.sessions.popitem(last=False)
+
+    def _expire(self, now):
+        for origin, messages in list(self.sessions.items()):
+            while messages and now - messages[0][1] > 120:
+                messages.popleft()
+            if not messages:
+                del self.sessions[origin]
+
+    def latest(self, origin, message_id, now=None):
+        self._expire(time.monotonic() if now is None else now)
+        for previous_id, _, videos in reversed(self.sessions.get(origin, ())):
+            if previous_id != message_id and videos:
+                return list(videos[:1])
+        return []
 
 
 async def _worker(function, *args):
@@ -440,7 +545,7 @@ async def describe_native(provider, path, options, prompt, model=""):
 
 async def understand_video(
     source, provider, options=None, gif_options=None, *, question="", model="",
-    capability=None, for_main=False,
+    capability=None, for_main=False, transcriber=None, origin="",
 ):
     options = options or VideoOptions()
     gif_options = gif_options or GifOptions()
@@ -452,8 +557,11 @@ async def understand_video(
         config.get("id", ""), config.get("modalities"),
         {"video_mode": options.mode},
     )
-    if capability == "none":
+    if capability == "none" and (
+        not transcriber or options.audio_transcribe == "off" or not transcriber.available(origin)
+    ):
         return VideoResult(text=NO_VISION, reason="none")
+    transcript = ""
     try:
         with tempfile.TemporaryDirectory(prefix="context-aware-video-") as directory:
             path = await _materialize(source, directory, options)
@@ -475,6 +583,7 @@ async def understand_video(
                             text="", reason="native_main", video=data,
                             mime=mimetypes.guess_type(native_path)[0] or "video/mp4",
                             family=video_family(_model(provider, model), config.get("id", "")),
+                            origin=origin,
                         )
                     prompt = (
                         "请描述视频的动作、事件顺序、画面文字和声音；关键事件标注时间。结合用户问题提供可核对的观察。\n用户问题："
@@ -487,25 +596,33 @@ async def understand_video(
                     return VideoResult(text="[视频观察]\n" + text, reason="native")
                 except Exception:
                     pass  # Do not log provider errors containing request media/auth.
-            images = await _worker(
-                extract_video_frames,
-                path,
-                duration,
-                options,
-                gif_options,
-                directory,
-                time.monotonic() + min(30, options.timeout_sec),
-            )
+            if transcriber:
+                try:
+                    transcript = await transcriber.transcribe(path, duration, options, origin)
+                except Exception:
+                    pass
+            if capability == "none":
+                return VideoResult(text=NO_VISION + ("\n" + transcript if transcript else ""),
+                                   reason="none", transcript=transcript)
+            try:
+                images = await _worker(
+                    extract_video_frames, path, duration, options, gif_options, directory,
+                    time.monotonic() + min(30, options.timeout_sec),
+                )
+            except Exception:
+                images = ()
             if images:
                 layout = "，分别附图" if len(images) > 1 else "拼成网格"
                 return VideoResult(
-                    text=f"[视频：已按时间顺序抽取{options.fallback_frames}帧{layout}；标有序号和时间]",
+                    text=f"[视频：已按时间顺序抽取{options.fallback_frames}帧{layout}；标有序号和时间]" + ("\n" + transcript if transcript else ""),
                     images=images,
                     reason="frames",
+                    transcript=transcript,
                 )
     except Exception:
         pass
-    return VideoResult()
+    note = NO_VISION if capability == "none" else UNPARSED
+    return VideoResult(text=note + ("\n" + transcript if transcript else ""), transcript=transcript)
 
 
 class MainVideoAdapter:
@@ -516,11 +633,12 @@ class MainVideoAdapter:
     Provider methods are restored on plugin termination; plans follow event GC.
     """
 
-    def __init__(self, provider, options, gif_options, config=None):
+    def __init__(self, provider, options, gif_options, config=None, transcriber=None):
         self.provider = provider
         self.options = options
         self.gif_options = gif_options
         self.config = config or {}
+        self.transcriber = transcriber
         self.plans = weakref.WeakValueDictionary()
         self.originals = {}
         self.wrappers = {}
@@ -655,22 +773,42 @@ class MainVideoAdapter:
 
     async def _frames(self, payload, plans):
         replacements = {}
+        textual = {}
         for token, result in plans.items():
+            fallback = result
             try:
-                fallback = result
                 if result.video:
                     source = await _worker(lambda: f"data:{result.mime};base64," + base64.b64encode(result.video).decode("ascii"))
                     fallback = await understand_video(
                         source, None, replace(self.options, mode="frames"), self.gif_options,
                         capability="frames",
+                        transcriber=self.transcriber, origin=result.origin,
                     )
                 parts = [{"type": "text", "text": fallback.text}]
                 for data, mime in fallback.images:
                     url = await _worker(lambda: f"data:{mime};base64," + base64.b64encode(data).decode("ascii"))
                     parts.append({"type": "image_url", "image_url": {"url": url}})
                 replacements[token] = parts
+                textual[token] = [{"type": "text", "text": UNPARSED + ("\n" + fallback.transcript if fallback.transcript else "")}]
             except Exception:
-                replacements[token] = [{"type": "text", "text": UNPARSED}]
+                replacements[token] = [{"type": "text", "text": UNPARSED + ("\n" + fallback.transcript if fallback.transcript else "")}]
+                textual[token] = replacements[token]
+        return self._replace(payload, replacements), self._replace(payload, textual)
+
+    async def _text_only(self, payload, plans):
+        replacements = {}
+        for token, result in plans.items():
+            fallback = result
+            try:
+                if result.video:
+                    source = await _worker(lambda: f"data:{result.mime};base64," + base64.b64encode(result.video).decode("ascii"))
+                    fallback = await understand_video(
+                        source, None, self.options, self.gif_options, capability="none",
+                        transcriber=self.transcriber, origin=result.origin,
+                    )
+            except Exception:
+                pass
+            replacements[token] = [{"type": "text", "text": NO_VISION + ("\n" + fallback.transcript if fallback.transcript else "")}]
         return self._replace(payload, replacements)
 
     async def query(self, payload, *args, **kwargs):
@@ -683,9 +821,7 @@ class MainVideoAdapter:
             payload.get("model", ""), config.get("id", ""), config.get("modalities"), self.config,
         )
         if capability == "none":
-            return await original(self._replace(payload, {
-                token: [{"type": "text", "text": NO_VISION}] for token in plans
-            }), *args, **kwargs)
+            return await original(await self._text_only(payload, plans), *args, **kwargs)
 
         async def native():
             async with self._native_payload(payload, plans) as prepared:
@@ -696,11 +832,11 @@ class MainVideoAdapter:
                 return await asyncio.wait_for(native(), self.options.timeout_sec)
             except Exception:
                 pass  # Provider exceptions may include media/credentials; do not log.
-        frames = await self._frames(payload, plans)
+        frames, textual = await self._frames(payload, plans)
         try:
             return await original(frames, *args, **kwargs)
         except Exception:
-            return await original(self._replace(payload, {}), *args, **kwargs)
+            return await original(textual, *args, **kwargs)
 
     async def query_stream(self, payload, *args, **kwargs):
         plans = self._find(payload)
@@ -714,9 +850,7 @@ class MainVideoAdapter:
             payload.get("model", ""), config.get("id", ""), config.get("modalities"), self.config,
         )
         if capability == "none":
-            prepared = self._replace(payload, {
-                token: [{"type": "text", "text": NO_VISION}] for token in plans
-            })
+            prepared = await self._text_only(payload, plans)
             async for response in original(prepared, *args, **kwargs):
                 yield response
             return
@@ -741,10 +875,10 @@ class MainVideoAdapter:
             # Buffer this video's stream so a late rejection cannot duplicate output.
             responses = await asyncio.wait_for(native(), self.options.timeout_sec)
         except Exception:
-            frames = await self._frames(payload, plans)
+            frames, textual = await self._frames(payload, plans)
             try:
                 responses = await collect(frames)
             except Exception:
-                responses = await collect(self._replace(payload, {}))
+                responses = await collect(textual)
         for response in responses:
             yield response

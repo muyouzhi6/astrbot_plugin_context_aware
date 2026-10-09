@@ -19,9 +19,13 @@ from video_input import (
     UNPARSED,
     MainVideoAdapter,
     VideoOptions,
+    RecentVideos,
     describe_native,
+    downloaded_video_paths,
     is_video_component,
     understand_video,
+    video_source,
+    walk_message_chain,
 )
 
 
@@ -94,7 +98,7 @@ def compat_provider(model="gemini-2.5-flash"):
 @pytest.mark.asyncio
 async def test_disabled_is_noop_without_io():
     with patch("video_input._materialize", side_effect=AssertionError):
-        result = await understand_video("not-readable", None)
+        result = await understand_video("not-readable", None, VideoOptions(enabled=False))
     assert result.reason == "disabled" and not result.text and not result.images
 
 
@@ -319,7 +323,7 @@ async def test_plugin_disabled_and_hook_injection(video, tmp_path):
 
     module = load_plugin_module()
     plugin = module.Main(
-        FakeContext(), {"enable": False, "image_cache_dir": str(tmp_path / "cache")}
+        FakeContext(), {"enable": False, "video_understanding_enabled": False, "image_cache_dir": str(tmp_path / "cache")}
     )
     event = FakeCompressionEvent(private=True)
     Video = type("Video", (), {})
@@ -538,7 +542,7 @@ async def test_no_vision_skips_all_video_work_and_source_access(tmp_path):
     module, plugin, event, req = plugin_request(tmp_path, provider)
     component = attach_video(event, tmp_path / "unreadable.mp4")
     try:
-        with patch.object(module, "understand_video", side_effect=AssertionError), patch("video_input.extract_video_frames", side_effect=AssertionError):
+        with patch("video_input._materialize", side_effect=AssertionError), patch("video_input.extract_video_frames", side_effect=AssertionError):
             await plugin.on_llm_request(event, req)
         component.get_file.assert_not_awaited()
         assert not req.image_urls
@@ -546,6 +550,191 @@ async def test_no_vision_skips_all_video_work_and_source_access(tmp_path):
         provider.client.chat.completions.create.assert_not_awaited()
     finally:
         await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_nested_quoted_video_and_file_prefer_local_and_deduplicate(video, tmp_path):
+    provider = MockChatProvider("gemini-3-flash")
+    module, plugin, event, req = plugin_request(tmp_path, provider)
+    file = module.File(name="clip.mp4", file=str(video), url="http://127.0.0.1/unsafe.mp4")
+    file.get_file = AsyncMock(side_effect=AssertionError("must reuse Core local file"))
+    inner, outer = module.Reply(), module.Reply()
+    inner.chain = [file]
+    outer.chain = [inner, file]
+    event.get_messages = lambda: [outer]
+    try:
+        await plugin.on_llm_request(event, req)
+        assert len(req.extra_user_content_parts) == 1
+        await run_chat(provider, req)
+        content = provider.client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert sum(p["type"] == "image_url" and p["image_url"]["url"].startswith("data:video/") for p in content) == 1
+        file.get_file.assert_not_awaited()
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_quoted_video_reuses_core_textual_temp_path(video, tmp_path):
+    provider = MockChatProvider("gpt-4o")
+    module, plugin, event, req = plugin_request(tmp_path, provider)
+    local = tmp_path / "media_video_core.mp4"
+    local.write_bytes(video.read_bytes())
+    component = type("Video", (), {})()
+    component.url = "http://127.0.0.1/must-not-download.mp4"
+    component.get_file = AsyncMock(side_effect=AssertionError)
+    reply = module.Reply()
+    reply.chain = [component]
+    event.get_messages = lambda: [reply]
+    req.prompt += f"\n[引用视频] {local}\n"
+    try:
+        with patch.object(module, "get_astrbot_temp_path", return_value=str(tmp_path)):
+            await plugin.on_llm_request(event, req)
+        await run_chat(provider, req)
+        assert any(p["type"] == "image_url" for p in provider.client.chat.completions.create.call_args.kwargs["messages"][0]["content"])
+        component.get_file.assert_not_awaited()
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_quoted_private_url_fails_silently_without_component_downloader(tmp_path):
+    provider = MockChatProvider("gpt-4o")
+    module, plugin, event, req = plugin_request(tmp_path, provider)
+    component = type("Video", (), {})()
+    component.url = "http://127.0.0.1/private.mp4"
+    component.get_file = AsyncMock(side_effect=AssertionError)
+    reply = module.Reply()
+    reply.chain = [component]
+    event.get_messages = lambda: [reply]
+    try:
+        await plugin.on_llm_request(event, req)
+        assert [p.text for p in req.extra_user_content_parts] == [UNPARSED]
+        assert await run_chat(provider, req)
+        component.get_file.assert_not_awaited()
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_at_bot_recalls_latest_same_session_video_without_context_feature(video, tmp_path):
+    from test_llm_image_compression import FakeCompressionEvent
+
+    provider = MockChatProvider("gpt-4o")
+    module, plugin, previous, _ = plugin_request(tmp_path, provider)
+    attach_video(previous, video)
+    event = FakeCompressionEvent(private=True)
+    event.get_messages = lambda: [module.At("bot")]
+    event.get_self_id = lambda: "bot"
+    req = SimpleNamespace(prompt="说了什么？", image_urls=[], extra_user_content_parts=[])
+    try:
+        await plugin.on_message(previous)
+        await plugin.on_llm_request(event, req)
+        assert req.extra_user_content_parts
+        await run_chat(provider, req)
+        assert any(p["type"] == "image_url" for p in provider.client.chat.completions.create.call_args.kwargs["messages"][0]["content"])
+        for messages, origin in (([module.At("someone-else")], event.unified_msg_origin),
+                                 ([module.At("bot")], "aiocqhttp:private:other"), ([], event.unified_msg_origin)):
+            other = FakeCompressionEvent(private=True)
+            other.unified_msg_origin = origin
+            other.get_messages = lambda: messages
+            other.get_self_id = lambda: "bot"
+            other_req = SimpleNamespace(prompt="？", image_urls=[], extra_user_content_parts=[])
+            await plugin.on_llm_request(other, other_req)
+            assert not other_req.extra_user_content_parts
+    finally:
+        await plugin.terminate()
+
+
+def test_recent_videos_message_window_time_window_session_cap_and_no_reply_refresh():
+    history = RecentVideos()
+    video = type("Video", (), {})()
+    history.record("room", "first", [video], now=0)
+    assert history.latest("room", "next", now=119) == [video]
+    assert history.latest("other", "next", now=119) == []
+    assert history.latest("room", "next", now=121) == []
+    history.record("room", "first", [video], now=122)
+    for i in range(5):
+        history.record("room", str(i), [], now=123)
+    assert history.latest("room", "next", now=124) == []
+    for i in range(300):
+        history.record(str(i), "first", [video], now=125)
+    assert len(history.sessions) == 256
+    reply = type("Reply", (), {})()
+    reply.chain = [video]
+    history.record("quoted", "first", [reply], now=125)
+    assert history.latest("quoted", "next", now=126) == []
+
+
+def test_reply_traversal_is_cycle_safe_and_bounded():
+    reply = type("Reply", (), {})()
+    video = type("Video", (), {})()
+    reply.chain = [video, reply]
+    assert [type(c).__name__ for _, _, c in walk_message_chain([reply])] == ["Reply", "Video", "Reply"]
+    assert len(list(walk_message_chain([video] * 100))) == 64
+    outer = reply
+    for _ in range(20):
+        outer = type("Reply", (), {"chain": [outer]})()
+    assert len(list(walk_message_chain([outer]))) == 9
+
+
+def test_video_source_and_core_owned_paths(tmp_path):
+    local = tmp_path / "media_video_test.mp4"
+    local.write_bytes(b"test")
+    component = SimpleNamespace(path=str(tmp_path / "stale.mp4"), file=local.as_uri(), url="https://example.com/v.mp4")
+    assert video_source(component) == str(local)
+    local.unlink()
+    assert video_source(component) == component.url
+    local.write_bytes(b"test")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    other = outside / "media_video_other.mp4"
+    other.write_bytes(b"test")
+    req = SimpleNamespace(prompt=f"{local}\n{other}\n/etc/passwd", extra_user_content_parts=[])
+    assert downloaded_video_paths(req, outside) == [str(other)]
+
+
+def test_file_source_detection_never_accesses_downloading_property(tmp_path):
+    class File:
+        name = "opaque-attachment"
+        file_ = str(tmp_path / "local.mp4")
+        url = "http://127.0.0.1/private.mp4"
+
+        @property
+        def file(self):
+            raise AssertionError("unsafe downloading property")
+
+    assert is_video_component(File())
+    assert video_source(File()) == File.url
+
+
+def test_video_configuration_defaults_and_old_keys():
+    assert VideoOptions().enabled
+    options = VideoOptions.from_mapping({})
+    assert options.enabled and options.max_duration_sec == 120
+    assert options.audio_transcribe == "auto" and options.mode == "auto"
+    assert VideoOptions.from_mapping({"video_audio_transcribe": "off"}).audio_transcribe == "off"
+    assert VideoOptions.from_mapping({"video_audio_transcribe": "invalid"}).audio_transcribe == "auto"
+    assert VideoOptions.from_mapping({"video_mode": "frames"}).mode == "frames"
+    assert VideoOptions.from_mapping({"video_capability_override": "native"}).mode == "native"
+
+
+@pytest.mark.asyncio
+async def test_query_model_switch_to_text_and_failed_audio_preparation_still_chats():
+    from video_input import VideoResult
+
+    provider = MockChatProvider("gpt-4o")
+    adapter = MainVideoAdapter(provider, VideoOptions(), GifOptions(), {"video_capability_override": "none"})
+    assert adapter.install()
+    result = VideoResult(video=b"video", transcript="[视频语音转写，约 2 秒] 已有文字")
+    token = adapter.register(result)
+    payload = {"model": "deepseek-chat", "messages": [{"role": "user", "content": [{"type": "text", "text": token}]}]}
+    try:
+        with patch("video_input.understand_video", side_effect=ValueError("preparation failed")):
+            await provider._query(payload)
+        content = provider.client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        assert content == [{"type": "text", "text": NO_VISION + "\n" + result.transcript}]
+    finally:
+        adapter.close()
 
 
 @pytest.mark.asyncio
@@ -1004,7 +1193,7 @@ async def _verify_real_astrbot(video, root):
     from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
     from astrbot.core.platform.message_type import MessageType
     from astrbot.core.platform.platform_metadata import PlatformMetadata
-    from astrbot.api.message_components import Video
+    from astrbot.api.message_components import At, File, Reply, Video
     import main
 
     assert version("astrbot") == "4.28.2"
@@ -1021,7 +1210,14 @@ async def _verify_real_astrbot(video, root):
         ("gemini-3-flash", "native", True, True),
         ("gemini-3-flash", "frames", True, True),
     ]
-    for index, (model, capability, reject, gemini) in enumerate(cases):
+    cases = [(*case, "") for case in cases] + [
+        ("gpt-4o", "frames", False, False, "video"),
+        ("gemini-3-flash", "native", False, True, "video"),
+        ("deepseek-chat", "none", False, False, "video"),
+        ("gemini-3-flash", "native", False, False, "file"),
+        ("gpt-4o", "frames", False, False, "downloaded"),
+    ]
+    for index, (model, capability, reject, gemini, quoted) in enumerate(cases):
         modalities = ["text"] if capability == "none" else ["text", "image", "tool_use"]
         config = {"id": "integration", "type": "gemini" if gemini else "openai_chat_completion", "key": ["offline-test-placeholder"], "api_base": "https://example.invalid", "model": model, "modalities": modalities}
         provider = (ProviderGoogleGenAI if gemini else ProviderOpenAIOfficial)(config, {})
@@ -1053,11 +1249,21 @@ async def _verify_real_astrbot(video, root):
         raw.message_str = "解释视频"
         event = AstrMessageEvent(raw.message_str, raw, PlatformMetadata("test", "test", "test"), "test")
         req = ProviderRequest(prompt=raw.message_str, model=model)
+        if quoted:
+            component = raw.message[0]
+            if quoted == "file":
+                component = File(name="clip.mp4", file=str(video), url="https://example.invalid/must-not-download.mp4")
+            elif quoted == "downloaded":
+                downloaded = root / "media_video_quoted.mp4"
+                downloaded.write_bytes(video.read_bytes())
+                component = Video(file="https://example.invalid/must-not-download.mp4")
+                req.prompt += f"\n[视频文件] {downloaded}\n"
+            raw.message = [Reply(id="parent", chain=[Reply(id="nested", chain=[component])]), At(qq="bot")]
         original_query = provider._query
         sdk = provider.client.models if gemini else provider.client.chat.completions
         method = "generate_content" if gemini else "create"
         try:
-            with patch.object(sdk, method, AsyncMock(side_effect=create)):
+            with patch.object(sdk, method, AsyncMock(side_effect=create)), patch.object(main, "get_astrbot_temp_path", return_value=str(root)):
                 await plugin.on_llm_request(event, req)
                 assert all(isinstance(p, TextPart) for p in req.extra_user_content_parts)
                 # Core assembles ContentParts, validates Message and sanitizes
@@ -1097,7 +1303,7 @@ async def _verify_real_astrbot(video, root):
             assert provider._query == original_query
             event.cleanup_temporary_local_files()
             await provider.terminate()
-    print("PASS real AstrBot 4.28.2: 11 provider/Core scenarios")
+    print("PASS real AstrBot 4.28.2: 16 provider/Core scenarios")
 
 
 def test_real_astrbot_4282_core_and_providers(video, tmp_path):
@@ -1112,4 +1318,4 @@ def test_real_astrbot_4282_core_and_providers(video, tmp_path):
     script = "import asyncio, runpy, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); module = runpy.run_path(sys.argv[2]); asyncio.run(module['_verify_real_astrbot'](Path(sys.argv[3]), Path.cwd()))"
     result = subprocess.run([interpreter, "-c", script, str(repo), str(Path(__file__).resolve()), str(video)], cwd=tmp_path, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS real AstrBot 4.28.2: 11" in result.stdout
+    assert "PASS real AstrBot 4.28.2: 16" in result.stdout

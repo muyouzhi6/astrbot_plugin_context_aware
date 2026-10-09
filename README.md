@@ -4,69 +4,35 @@
 
 配置面板按群聊场景与历史摘要、图片与语音、私聊场景与话题摘要的顺序排列。功能更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-## v3.8.0：动图与视频理解
+## v3.9.0：视频和声音，发来就能看
 
-GIF 默认按累计帧时长均匀抽取最多 6 帧，去掉相邻近似重复画面，再生成一张带序号和时间的网格图。阅读顺序为从左到右、从上到下。`gif_mode=frames` 发送多张独立帧图；`first_frame` 使用首帧。当前附件、引用、请求历史、图片回看和图像转述使用同一套处理规则；GIF 处理独立于静态图片压缩开关。单帧 GIF 输出静态 PNG；PNG/JPEG/WebP 的原有处理方式保持不变，动画 WebP/APNG 沿用原处理方式。关闭静态图片压缩时，静态附件、历史图片和额外图片内容保持原引用，不为格式识别下载图片；开启压缩后复用已下载的本地引用，历史图片继续转换为自包含 data URI。
+直接发送视频，或引用视频并 @机器人，再问“发生了什么”“视频里说了什么”。只 @机器人提问时，也会寻找同一会话最近 5 条消息、120 秒内的最新视频；本轮已发送或引用的视频优先。
 
-`show_recent_images_allow_gif` 继续控制最近图片区块、回看索引及图像转述。当前附件和请求历史中的 GIF 按 `gif_mode` 处理。源 GIF 保留供图片引用接口使用，抽帧预览不会替换编辑参考。每张动图仍对应一个 `[图片]` 标记。
+插件自动跟随聊天模型选择处理方式：
 
-视频理解默认关闭。开启 `video_understanding_enabled` 后处理 Video 组件和常见视频文件，按实际请求的模型与 Provider 分三档。GIF 多帧默认开启，不依赖视频开关。
-
-| 能力档位 | GIF | 视频（开启视频理解后） |
-|---|---|---|
-| `none` 无视觉 | 文本 `[动图]`，不生成帧图或网格 | 文本 `[视频：当前模型不支持查看]`，不读取视频、不调用模型、不抽帧 |
-| `frames` 图片视觉 | 按 `gif_mode` 多帧网格或独立图片 | ffmpeg 按时间抽帧，以 PNG/JPEG 图片进入主请求；接口拒绝后重试文本提示 |
-| `native` 原生视频 | 按 `gif_mode` 处理 | 真实视频优先进入主请求；接口拒绝后重试图片抽帧，再失败使用文本提示 |
-
-判定优先级：非 `auto` 的全局 `video_capability_override` → 三个覆盖列表 → 旧 `video_mode` → Provider `modalities` → 模型家族。列表匹配模型名或 Provider ID，支持不区分大小写的子串与 `*`、`?` 通配符；重叠时 `none` → `frames` → `native`。`modalities` 已配置且没有 `image` 时为 `none`；有 `image` 和 `video` 时为 `native`；有 `image` 时，Gemini、Qwen-VL/Omni、GLM-4V/4.xV、豆包 vision/seed 家族进入 `native`，其余为 `frames`。能识别 `newapigemini/gemini-3.8-flash` 等前缀名和 Provider ID。Provider 信息缺失、名称未知时默认 `frames`。普通 PNG/JPEG 等静态图片沿用原行为，由 AstrBot 核心按 modalities 过滤。
-
-AstrBot 4.28.2 的 ContentPart 支持文本、图片和音频。插件用临时标记穿过核心媒体处理，在 OpenAI/Gemini Provider 的请求入口转换成视频或抽帧图片 part，保留主请求的问题、历史与工具。原生 Gemini 小文件使用 `inline_data`，大文件使用 Files API，等待 ACTIVE 并在请求结束或取消时删除上传文件。缺少适配入口的原生视频 Provider 使用现有客户端预调用描述，再注入临时文本，该路径增加一次模型调用；抽帧结果采用文本提示。原生与图片重试仍保留普通静态附件；输入超限、ffmpeg/ffprobe 缺失或解析失败时使用 `[视频：未能解析]`。视频请求的流式结果在成功后交付，避免晚期失败产生重复回答。
-
-| OpenAI 兼容家族 | 主请求视频 content part |
+| 模型能力 | 处理方式 |
 |---|---|
-| Gemini / New API | `{"type":"image_url","image_url":{"url":"data:video/mp4;base64,..."}}`，保留视频 MIME |
-| Qwen DashScope | `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}` |
-| GLM | `{"type":"video_url","video_url":{"url":"裸 Base64"}}`，在该条 content 中排在文本前 |
-| 豆包方舟 Chat | `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,...","fps":1}}` |
+| 能直接看视频，如 Gemini | 发送原视频和声音；失败后自动抽帧 |
+| 能看图片 | 按时间抽取画面，配上视频里的语音文字 |
+| 文本模型 | 配上视频里的语音文字和视频提示 |
 
-Qwen 官方另支持 `{"type":"video","video":["帧 URL 或 data:image/...", "..."]}` 的有序帧列表（至少 4 张）。本插件原生档发送真实视频文件；第二档发送通用图片网格或独立 `image_url`，也用于原生失败后的回退。Qwen-VL 和抽帧路径读取画面；Qwen-Omni 等音视频模型可读取声音。GLM 的图像与视频混合请求若被接口拒绝，自动改用抽帧图片。
+语音识别自动使用 AstrBot 当前会话或全局配置的 STT 服务，再尝试第一个已启用的服务。没有语音服务或视频没有音轨时，继续使用画面或文字提示；识别失败也继续聊天。插件不下载、不运行本地语音模型。转写最多处理设定时长的前段音频，等待最多 25 秒，保留约 2000 字并缓存；日志不记录转写原文。原生视频成功时直接使用视频声音，不另做转写。
 
-GIF 解码、拼图与 ffmpeg 操作在线程或子进程执行。逐帧检查时限，GIF 超过解码帧数或遇到异常时尝试首帧；首帧也失败则保留原引用。解码前检查各帧描述符、偏移和累计画布尺寸；超过源大小或任一帧画布上限时直接保留原引用。单帧边长、输出总像素和总字节分别限制，序号文字也计入输出像素；PNG 过大时改用 JPEG 或缩小。视频 Base64 解码在工作线程执行；视频与新增 GIF 远程下载使用 HTTP/HTTPS，逐跳校验重定向及 DNS 地址，拒绝内网、回环和链路本地地址，并检查声明大小与实际读取字节。ffprobe 检查视频时长；本地处理每阶段最长 30 秒，临时目录在结束或取消时清理。
+视频面板显示三项：
 
-| GIF 配置 | 默认值 |
-|---|---:|
-| `gif_mode` | `grid` |
-| `gif_max_frames` | `6` |
-| `gif_frame_max_edge` | `512` 像素 |
-| `gif_max_total_pixels` | `2000000` |
-| `gif_max_output_bytes` | `2097152`（2 MiB） |
-| `gif_max_source_bytes` | `20971520`（20 MiB） |
-| `gif_max_source_pixels` | `25000000` |
-| `gif_max_decode_frames` | `300` |
-| `gif_timeout_sec` | `5` 秒，首帧恢复另计一次 |
-| `gif_dedup_threshold` | `2.0`，32×32 RGB 缩略图平均差 |
+| 配置项 | 默认值 | 用途 |
+|---|---|---|
+| `video_understanding_enabled` | 开启 | 是否处理视频 |
+| `video_max_duration_sec` | 120 秒 | 接收的视频时长上限 |
+| `video_audio_transcribe` | `auto` | 自动识别说话声；`off` 关闭额外识别 |
 
-| 视频配置 | 默认值 |
-|---|---:|
-| `video_understanding_enabled` | `false` |
-| `video_max_bytes` | `52428800`（50 MiB） |
-| `video_max_duration_sec` | `120` 秒 |
-| `video_capability_override` | `auto`（选项 `auto/native/frames/none`） |
-| `video_native_models` | `[]` |
-| `video_frames_only_models` | `[]` |
-| `video_no_vision_models` | `[]` |
-| `video_fallback_frames` | `6` |
-| `video_inline_max_bytes` | `12582912`（12 MiB） |
-| `video_timeout_sec` | `60` 秒，包含模型调用、上传和轮询 |
-| `video_transcode` | `false` |
+模型能力默认自动判断。旧的能力覆盖、模型列表、`video_mode`、抽帧、转码、超时、大小上限和 `video_stt_provider_id` 设置继续读取，面板隐藏这些高级项；保留的强制模式在发送失败后仍会自动回退。
 
-内联阈值按原文件字节配置，最高 12 MiB；发送前再计算 Base64 膨胀、提示词及请求开销，将总量控制在 20 MB 以下。兼容接口的大视频直接转抽帧。可选转码输出 H.264/AAC MP4，最长边 960，视频码率上限约 1.5 Mbps、音频 64 kbps。视频回退图复用 GIF 的边长、总像素和输出字节配置。
+GIF 默认生成带序号和时间的多帧网格，引用里的 GIF 和图片也会进入本次请求。GIF 与静态图片压缩开关独立；`gif_mode` 的 `frames`、`first_frame` 旧设置继续有效。源动图仍用于图片编辑参考。
 
-旧 `video_mode=frames/native` 在全局覆盖为 `auto` 且未命中覆盖列表时继续生效，无需改写旧配置；新面板统一使用 `video_capability_override`。按显示时长采样保留长停顿的权重，相邻帧差去重减少重复画面；独立帧模式提供更大的逐帧阅读空间。短于采样间隔的动作可能遗漏，抽帧图片不含声音。
+默认接收 120 秒以内、50 MiB 以内的视频。抽帧和声音提取使用 ffmpeg/ffprobe；超长视频请剪短，超大视频请压缩后再发送。媒体解析或接口失败时，按原视频、抽帧、文字提示依次尝试。下载检查公网地址、重定向与文件大小，优先复用 AstrBot 已下载的本地视频。
 
-回归测试：`python3 -m pytest -q tests`、`python3 -m ruff check .`。真实框架测试使用 AstrBot 4.28.2，可通过 `ASTRBOT_TEST_PYTHON=/path/to/venv/bin/python` 指定已安装该版本的解释器；测试运行真实 Core、ContentPart、modalities 过滤与 OpenAI/Gemini Provider，SDK 响应由本地测试模拟。
-
-参考资料：[Gemini 视频理解](https://ai.google.dev/gemini-api/docs/video-understanding)、[Gemini Files API](https://ai.google.dev/gemini-api/docs/files)、[Qwen DashScope 视频与帧列表](https://help.aliyun.com/zh/model-studio/vision)、[DashScope OpenAI 兼容参数](https://help.aliyun.com/en/model-studio/qwen-api-via-openai-chat-completions)、[GLM 视频与 Base64 示例](https://docs.bigmodel.cn/cn/guide/models/vlm/glm-4v-plus-0111)、[豆包方舟视频理解](https://www.volcengine.com/docs/82379/1895586)、[New API 转 Gemini](https://github.com/QuantumNous/new-api/blob/128089fa7ddf41b575206a0feb28940d33793833/relaykit/relayconvert/internal/oai_chat/to_gemini_chat_req.go)、[AstrBot 4.28.2 ContentPart](https://github.com/AstrBotDevs/AstrBot/blob/v4.28.2/astrbot/core/agent/message.py)。
+验证命令：`python3 -m pytest -q tests`、`python3 -m ruff check .`。测试视频在运行时生成，不提交素材文件。可设置 `ASTRBOT_TEST_PYTHON=/path/to/venv/bin/python`，运行 AstrBot 4.28.2 的真实框架回归。
 
 ## v3.7.1 更新
 

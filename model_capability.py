@@ -1,4 +1,4 @@
-"""Pure capability decisions for GIF previews and opt-in video input."""
+"""Pure capability decisions for GIF previews and automatic video input."""
 
 from __future__ import annotations
 
@@ -8,9 +8,9 @@ from typing import Mapping
 
 
 def video_family(model="", provider_id=""):
-    model = str(model or "").casefold()
+    model = str(model or "").casefold().rsplit("/", 1)[-1]
     # A routing prefix/Provider ID must not change a recognized actual model.
-    for name in (model.rsplit("/", 1)[-1], model, str(provider_id or "").casefold()):
+    for name in (model,):
         if "gemini" in name:
             return "gemini"
         if re.search(r"qwen(?:[\d.]+)?[-_](?:vl|omni)", name):
@@ -19,7 +19,9 @@ def video_family(model="", provider_id=""):
             return "glm"
         if re.search(r"doubao[-_][^ /]*(?:vision|seed)", name):
             return "doubao"
-    return ""
+    if re.search(r"(?:^|/)(?:gpt|o[134](?:-|$)|claude|deepseek|llama|mistral|qwen|glm|doubao|grok)", model):
+        return ""
+    return video_family(provider_id) if provider_id else ""
 
 
 def _matches(patterns, names):
@@ -62,8 +64,13 @@ def detect_video_capability(model="", provider_id="", modalities=None, config=No
         return legacy
     if isinstance(modalities, (list, tuple, set)):
         modes = {str(value).casefold() for value in modalities}
-        if "image" not in modes:
-            return "none"
         if "video" in modes:
             return "native"
+        if "image" not in modes:
+            return "none"
+    elif not video_family(model) and re.search(
+        r"(?:^|/)(?:deepseek|llama|mistral|qwen|glm|doubao|gpt-3\.5)",
+        str(model or "").casefold(),
+    ):
+        return "none"
     return "native" if video_family(model, provider_id) else "frames"

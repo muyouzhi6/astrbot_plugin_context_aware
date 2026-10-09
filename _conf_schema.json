@@ -254,25 +254,41 @@
   "video_understanding_enabled": {
     "description": "启用视频理解",
     "type": "bool",
-    "default": false,
-    "hint": "开启后按实际请求模型三档处理：纯文本提示、图片抽帧、原生视频优先主请求；失败依次抽帧和文本。GIF 多帧独立默认开启。"
+    "default": true,
+    "hint": "直接发送或引用视频后提问即可。自动选择模型支持的方式，处理失败也会继续聊天。"
   },
   "video_max_bytes": {
     "description": "视频源文件字节上限",
     "type": "int",
     "default": 52428800,
+    "invisible": true,
     "hint": "每个视频在下载和读取时均检查大小。"
   },
   "video_max_duration_sec": {
     "description": "视频时长上限（秒）",
     "type": "int",
     "default": 120,
-    "hint": "使用 ffprobe 检查，超出时加入“[视频：未能解析]”。"
+    "hint": "默认处理 2 分钟以内的视频；更长的视频请剪短后发送。"
+  },
+  "video_audio_transcribe": {
+    "description": "视频里的说话声",
+    "type": "string",
+    "default": "auto",
+    "options": ["auto", "off"],
+    "hint": "auto：自动使用 AstrBot 已配置的语音识别；能直接看视频的模型接收原视频。off：关闭额外语音识别。"
+  },
+  "video_stt_provider_id": {
+    "description": "指定视频语音识别服务",
+    "type": "string",
+    "default": "",
+    "invisible": true,
+    "hint": "留空自动使用当前会话或全局语音识别服务，再尝试第一个已启用的服务。"
   },
   "video_capability_override": {
     "description": "GIF 与视频能力覆盖",
     "type": "string",
     "default": "auto",
+    "invisible": true,
     "hint": "auto 按覆盖列表、Provider modalities 与模型家族判定。native 原生视频、frames 图片抽帧、none 文本提示；非 auto 优先级最高。旧 video_mode=frames/native 在 auto 下继续生效。",
     "options": [
       "auto",
@@ -286,49 +302,56 @@
     "type": "string",
     "default": "auto",
     "invisible": true,
-    "hint": "保留旧配置，避免 AstrBot 配置完整性检查删除该键；新面板统一使用 video_capability_override。",
-    "options": ["auto", "native", "frames"]
+    "hint": "旧设置继续有效；auto 会随聊天模型自动选择处理方式。",
+    "options": ["auto", "native", "frames", "none"]
   },
   "video_native_models": {
     "description": "原生视频模型或 Provider 列表",
     "type": "list",
     "default": [],
+    "invisible": true,
     "hint": "模型名或 Provider ID，不区分大小写，支持子串和 * ? 通配符。列表覆盖自动判定；多列表重叠时 none 优先，其次 frames，再次 native。"
   },
   "video_frames_only_models": {
     "description": "图片抽帧模型或 Provider 列表",
     "type": "list",
     "default": [],
+    "invisible": true,
     "hint": "模型名或 Provider ID 的子串或通配符，例如 gemini 或 vendor/*。强制视频抽帧，GIF 仍按 gif_mode。"
   },
   "video_no_vision_models": {
     "description": "无视觉模型或 Provider 列表",
     "type": "list",
     "default": [],
-    "hint": "匹配后跳过视频下载、调用和抽帧，GIF 不生成帧图或网格，使用文本提示；普通静态图片沿用原行为。"
+    "invisible": true,
+    "hint": "这些模型用文字提示和视频语音转写，不发送视频或抽帧图片。"
   },
   "video_fallback_frames": {
     "description": "视频回退抽帧数",
     "type": "int",
     "default": 6,
+    "invisible": true,
     "hint": "按时间均匀抽取；gif_mode=frames 使用独立帧，其余模式生成网格。沿用 GIF 单格、像素和字节上限。"
   },
   "video_inline_max_bytes": {
     "description": "视频内联原文件字节上限",
     "type": "int",
     "default": 12582912,
+    "invisible": true,
     "hint": "最高 12 MiB，并计算 Base64 与请求开销；较大文件用原生 Gemini Files API，兼容接口转抽帧。"
   },
   "video_timeout_sec": {
     "description": "视频模型调用时限（秒）",
     "type": "int",
     "default": 60,
+    "invisible": true,
     "hint": "下载最长 15 秒，本地处理每阶段最长 30 秒；模型调用含上传与轮询。"
   },
   "video_transcode": {
     "description": "视频理解前转码",
     "type": "bool",
     "default": false,
+    "invisible": true,
     "hint": "可选 ffmpeg H.264/AAC 转码，最长边 960、视频码率最高约 1.5 Mbps；失败用源视频继续。"
   },
   "llm_image_compress": {

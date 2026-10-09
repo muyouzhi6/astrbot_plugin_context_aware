@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.8.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.9.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -91,7 +91,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.8.0
+Version: 3.9.0
 """
 
 from __future__ import annotations
@@ -127,11 +127,13 @@ from PIL import Image as PILImage
 try:
     from .gif_frames import GifOptions, prepare_gif
     from .model_capability import detect_video_capability
-    from .video_input import MainVideoAdapter, NO_VISION, VideoOptions, VideoResult, is_video_component, understand_video, UNPARSED
+    from .video_input import MainVideoAdapter, RecentVideos, VideoOptions, VideoResult, downloaded_video_paths, is_video_component, understand_video, video_source, walk_message_chain, UNPARSED
+    from .audio_transcribe import AudioTranscriber
 except ImportError:
     from gif_frames import GifOptions, prepare_gif
     from model_capability import detect_video_capability
-    from video_input import MainVideoAdapter, NO_VISION, VideoOptions, VideoResult, is_video_component, understand_video, UNPARSED
+    from video_input import MainVideoAdapter, RecentVideos, VideoOptions, VideoResult, downloaded_video_paths, is_video_component, understand_video, video_source, walk_message_chain, UNPARSED
+    from audio_transcribe import AudioTranscriber
 
 try:
     from .image_context import (
@@ -1577,6 +1579,8 @@ class Main(ImageReferenceAPI, star.Star):
         self._gif_options = GifOptions.from_mapping(self._config)
         self._video_options = VideoOptions.from_mapping(self._config)
         self._video_adapters = {}
+        self._recent_videos = RecentVideos()
+        self._audio_transcriber = AudioTranscriber(self._context, self._config)
         self._media_semaphore = asyncio.Semaphore(2)
         self._image_compress_output_dir = get_astrbot_temp_path()
 
@@ -1944,6 +1948,7 @@ class Main(ImageReferenceAPI, star.Star):
         reason: str,
     ) -> None:
         self._image_index.clear(event.unified_msg_origin)
+        self._recent_videos.sessions.pop(event.unified_msg_origin, None)
         removed = await self._sessions.remove_session_async(event.unified_msg_origin)
         if removed:
             logger.info(
@@ -2815,7 +2820,26 @@ class Main(ImageReferenceAPI, star.Star):
             return
 
         allow_gif = self._media_capability(event)[0] != "none"
-        for component in messages:
+        for chain, index, component in walk_message_chain(messages):
+            if isinstance(component, File) and chain is not messages and not is_video_component(component):
+                try:
+                    local_path = video_source(component)
+                    if not local_path or not os.path.isfile(local_path):
+                        local_path = await asyncio.wait_for(component.get_file(), 15)
+                    if not local_path or not os.path.isfile(local_path):
+                        continue
+                    image_format = await asyncio.to_thread(self._detect_local_image_format, local_path)
+                    if not image_format:
+                        continue
+                    promoted = Image.fromFileSystem(local_path)
+                    if isinstance(chain, list):
+                        chain[index] = promoted
+                    component = promoted
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(f"[ContextAware] 引用图片识别失败: {type(exc).__name__}")
+                    continue
             if isinstance(component, Image):
                 if not self._image_compress_options.enabled:
                     continue
@@ -2829,54 +2853,6 @@ class Main(ImageReferenceAPI, star.Star):
                 )
                 if compressed_ref and compressed_ref != source_ref and not self._gif_expansion(event, source_ref)[1]:
                     self._replace_component_image_ref(component, compressed_ref)
-            elif isinstance(component, Reply):
-                reply_chain = getattr(component, "chain", None) or []
-                for index, reply_component in enumerate(reply_chain):
-                    if isinstance(reply_component, File):
-                        try:
-                            local_path = await reply_component.get_file()
-                            if not local_path or not os.path.isfile(local_path):
-                                continue
-                            image_format = await asyncio.to_thread(
-                                self._detect_local_image_format,
-                                local_path,
-                            )
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception as e:
-                            logger.warning(
-                                f"[ContextAware] 引用文件图片识别失败, 已保留原文件: {type(e).__name__}"
-                            )
-                            continue
-
-                        if not image_format:
-                            continue
-
-                        promoted_image = Image.fromFileSystem(local_path)
-                        reply_chain[index] = promoted_image
-                        reply_component = promoted_image
-                        logger.info(
-                            f"[ContextAware] 引用图片文件已归一化: "
-                            f"{os.path.basename(local_path)} ({image_format})"
-                        )
-
-                    if not isinstance(reply_component, Image):
-                        continue
-                    if not self._image_compress_options.enabled:
-                        continue
-                    source_ref = self._component_image_ref(reply_component)
-                    if await asyncio.to_thread(_image_ref_looks_like_gif, source_ref):
-                        continue
-                    compressed_ref = await self._compress_image_reference(
-                        event,
-                        source_ref,
-                        allow_gif=allow_gif,
-                    )
-                    if compressed_ref and compressed_ref != source_ref and not self._gif_expansion(event, source_ref)[1]:
-                        self._replace_component_image_ref(
-                            reply_component,
-                            compressed_ref,
-                        )
 
     async def _compress_provider_request_images(
         self,
@@ -2902,6 +2878,30 @@ class Main(ImageReferenceAPI, star.Star):
                 if getattr(part, "text", None) in gif_notes:
                     part.text = "[动图]"
         image_urls = getattr(req, "image_urls", None)
+        try:
+            messages = event.get_messages()
+        except Exception:
+            messages = []
+        if any(isinstance(c, File) and chain is not messages and not is_video_component(c)
+               for chain, _, c in walk_message_chain(messages)):
+            await self._prepare_event_images_for_llm(event)
+        if isinstance(image_urls, list):
+            def identity(ref):
+                return urllib.parse.unquote(urllib.parse.urlsplit(ref).path) if ref.startswith("file://") else ref
+
+            known = {identity(ref) for ref in image_urls if isinstance(ref, str)}
+            for part in getattr(req, "extra_user_content_parts", []) or []:
+                ref = getattr(getattr(part, "image_url", None), "url", "")
+                if isinstance(ref, str):
+                    known.add(identity(ref))
+            for chain, _, component in walk_message_chain(messages):
+                if chain is messages or not isinstance(component, Image):
+                    continue
+                ref = self._component_image_ref(component)
+                previews, _ = self._gif_expansion(event, ref)
+                if ref and identity(ref) not in known and not any(identity(p) in known for p in previews):
+                    image_urls.append(ref)
+                    known.add(identity(ref))
         replacements: dict[str, str] = {}
         if isinstance(image_urls, list):
             compressed_urls: list[str] = []
@@ -3118,16 +3118,45 @@ class Main(ImageReferenceAPI, star.Star):
             return None
         key = id(provider)
         if key not in self._video_adapters:
-            adapter = MainVideoAdapter(provider, self._video_options, self._gif_options, self._config)
+            adapter = MainVideoAdapter(provider, self._video_options, self._gif_options, self._config, self._audio_transcriber)
             if not adapter.install():
                 return None
             self._video_adapters[key] = adapter
         return self._video_adapters[key]
 
+    def _observe_videos(self, event):
+        try:
+            if not self._video_options.enabled or event.get_extra("_context_aware_video_observed", False):
+                return
+            components = event.get_messages()
+            if not isinstance(components, (list, tuple)):
+                return
+            origin = event.unified_msg_origin
+            if self._session_reset_command(event):
+                self._recent_videos.sessions.pop(origin, None)
+            message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or id(event))
+            self._recent_videos.record(origin, message_id, components)
+            event.set_extra("_context_aware_video_observed", True)
+        except Exception:
+            return
+
     async def _prepare_request_videos(self, event, req):
         if not self._video_options.enabled:
             return
-        components = [c for c in event.get_messages() if is_video_component(c)]
+        self._observe_videos(event)
+        try:
+            messages = event.get_messages()
+        except Exception:
+            return
+        components = [c for _, _, c in walk_message_chain(messages) if is_video_component(c)]
+        if not components:
+            try:
+                at_bot = any(isinstance(c, At) and str(c.qq) == str(event.get_self_id()) for c in messages)
+            except Exception:
+                at_bot = False
+            if at_bot:
+                message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or id(event))
+                components = self._recent_videos.latest(event.unified_msg_origin, message_id)
         if not components:
             return
         capability, provider, model = self._media_capability(event, req)
@@ -3146,19 +3175,22 @@ class Main(ImageReferenceAPI, star.Star):
         results = cache.get(cache_key)
         if results is None:
             results = []
-            for component in components:
-                if capability == "none":
-                    results.append(VideoResult(text=NO_VISION, reason="none"))
-                    continue
+            downloaded = downloaded_video_paths(req, get_astrbot_temp_path())
+            seen_sources = set()
+            for index, component in enumerate(components):
                 try:
-                    source = self._component_image_ref(component)
-                    if not source and callable(getattr(component, "get_file", None)):
-                        source = await asyncio.wait_for(component.get_file(), 15)
+                    source = video_source(component)
+                    if len(downloaded) == len(components) and not os.path.isfile(source):
+                        source = downloaded[index]
+                    if source and source in seen_sources:
+                        continue
+                    seen_sources.add(source)
                     async with self._media_semaphore:
                         result = await understand_video(
                             source, provider, self._video_options, self._gif_options,
                             question=getattr(req, "prompt", ""), model=model,
                             capability=capability, for_main=bool(adapter),
+                            transcriber=self._audio_transcriber, origin=event.unified_msg_origin,
                         )
                     results.append(result)
                 except asyncio.CancelledError:
@@ -3175,7 +3207,7 @@ class Main(ImageReferenceAPI, star.Star):
             elif result.images:
                 # Unknown provider internals cannot guard rejection of main-request
                 # images. Keep this request textual rather than risk interruption.
-                text = VideoResult().text
+                text = UNPARSED + ("\n" + result.transcript if result.transcript else "")
             if text and not any(getattr(p, "text", "") == text for p in getattr(req, "extra_user_content_parts", []) or []):
                 self._inject_scene(req, text)
         refs = [ref for ref in getattr(req, "image_urls", []) or [] if ref not in before_refs]
@@ -3752,6 +3784,7 @@ class Main(ImageReferenceAPI, star.Star):
         if self._is_topic_inspect(event):
             return
         await self._topic_reset(event)
+        self._observe_videos(event)
         self._stamp_image_event(event)
         try:
             await self._prepare_event_images_for_llm(event)
@@ -4272,6 +4305,8 @@ class Main(ImageReferenceAPI, star.Star):
         for adapter in self._video_adapters.values():
             adapter.close()
         self._video_adapters.clear()
+        self._recent_videos.sessions.clear()
+        self._audio_transcriber.clear()
         if self._topic:
             await self._topic.close()
         await self._image_index.close()
