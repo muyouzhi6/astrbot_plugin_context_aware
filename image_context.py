@@ -8,6 +8,8 @@ import io
 import ipaddress
 import json
 import logging
+import nturl2path
+import os
 import re
 import socket
 import time
@@ -31,6 +33,21 @@ EPOCH_KEY = "_context_aware_image_epoch"
 SEEN_KEY = "_context_aware_images_seen"
 LOCK_KEY = "_context_aware_image_tool_lock"
 MIB = 1024 * 1024
+
+
+def _local_image_path(source: str) -> str:
+    if not source.lower().startswith("file://"):
+        return source
+    parsed = urlsplit(source)
+    if os.name == "nt":
+        path = parsed.path
+        if parsed.netloc and parsed.netloc.lower() != "localhost":
+            # Adapters also send file://C:\path, whose drive is in netloc.
+            path = parsed.netloc + path
+            if not re.match(r"^[A-Za-z]:", parsed.netloc):
+                path = "//" + path  # Preserve UNC server/share names.
+        return nturl2path.url2pathname(path.replace("\\", "/"))
+    return unquote(parsed.path)
 
 
 @dataclass(frozen=True)
@@ -431,11 +448,7 @@ class ImageIndex:
                 raise ValueError("too many image redirects")
         else:
             # Sources originate from adapter Image components, never tool args.
-            path = (
-                unquote(urlsplit(source).path)
-                if source.startswith("file://")
-                else source
-            )
+            path = _local_image_path(source)
 
             def read_local():
                 with Path(path).open("rb") as handle:

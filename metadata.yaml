@@ -23,7 +23,7 @@ help: |
   - 可独立使用，无需安装其他长期记忆插件。
 
   完整功能、配置与兼容性说明见 README。
-version: 3.9.0
+version: 3.10.0
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_context_aware
 astrbot_version: ">=4.26.8"

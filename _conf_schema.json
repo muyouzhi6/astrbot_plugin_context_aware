@@ -34,6 +34,12 @@
     "type": "bool",
     "default": true
   },
+  "show_sender_id": {
+    "description": "群聊场景发送者显示 ID",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，群聊场景的当前发送者、对话流、图片、语音和参与者显示为「昵称 (sender_id)」，QQ 平台显示 QQ 号。默认关闭。"
+  },
   "only_group_chat": {
     "description": "场景分析仅用于群聊（兼容配置）",
     "type": "bool",

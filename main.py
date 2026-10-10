@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.9.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.10.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -91,7 +91,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.9.0
+Version: 3.10.0
 """
 
 from __future__ import annotations
@@ -1246,6 +1246,16 @@ class SceneGenerator:
     __slots__ = ()
 
     @staticmethod
+    def format_sender(message: MessageRecord, show_sender_id: bool = False) -> str:
+        if message.is_bot:
+            return "[你]"
+        name = message.sender_name
+        sender_id = str(message.sender_id) if message.sender_id is not None else ""
+        if show_sender_id and sender_id and name != sender_id:
+            return f"{name} ({sender_id})" if name else sender_id
+        return name
+
+    @staticmethod
     def _escape(text: str) -> str:
         """XML 转义"""
         if not text:
@@ -1273,9 +1283,11 @@ class SceneGenerator:
         image_flow: list[MessageRecord] | None = None,
         voice_flow: list[MessageRecord] | None = None,
         private_chat: bool = False,
+        show_sender_id: bool = False,
     ) -> str:
         """生成场景描述，重点强调对话对象"""
         esc = self._escape
+        show_sender_id = show_sender_id and not private_chat
         parts: list[str] = ["<conversation_scene>"]
 
         # ===== 1. 触发类型 =====
@@ -1291,10 +1303,13 @@ class SceneGenerator:
             group_label="群里所有人（非特定对象）",
             multi_target_bot_label="你",
         )
+        current_sender = (
+            self.format_sender(current, True) if show_sender_id else current.sender_name
+        )
 
         parts.append(
             f"  <current_message>"
-            f"\n    <sender>{esc(current.sender_name)}</sender>"
+            f"\n    <sender>{esc(current_sender)}</sender>"
             f"\n    <talking_to>{esc(addressee_desc)}</talking_to>"
             f"\n    <content>{esc(current.content[:80])}</content>"
             f"\n  </current_message>"
@@ -1322,7 +1337,7 @@ class SceneGenerator:
                     group_label="群",
                     multi_target_bot_label="你",
                 )
-                sender = "[你]" if m.is_bot else m.sender_name
+                sender = self.format_sender(m, show_sender_id)
                 preview = m.content[:preview_limit] + (
                     "..." if len(m.content) > preview_limit else ""
                 )
@@ -1349,7 +1364,7 @@ class SceneGenerator:
                     group_label="群",
                     multi_target_bot_label="你",
                 )
-                sender = "[你]" if m.is_bot else m.sender_name
+                sender = self.format_sender(m, show_sender_id)
                 preview_source = content or m.message_outline or "[图片]"
                 preview = preview_source[:120] + (
                     "..." if len(preview_source) > 120 else ""
@@ -1381,7 +1396,7 @@ class SceneGenerator:
                 group_label="群",
                 multi_target_bot_label="你",
             )
-            sender = "[你]" if m.is_bot else m.sender_name
+            sender = self.format_sender(m, show_sender_id)
             preview = content[:200] + ("..." if len(content) > 200 else "")
             voice_lines.append(
                 f'    <voice sender="{esc(sender)}" talking_to="{esc(to_name)}">'
@@ -1552,6 +1567,7 @@ class Main(ImageReferenceAPI, star.Star):
         self._group_only = self._cfg_bool("only_group_chat", True)
         self._warn_builtin_ltm = self._cfg_bool("warn_builtin_ltm", True)
         self._show_recent_images = self._cfg_bool("show_recent_images", True)
+        self._show_sender_id = self._cfg("show_sender_id", False) is True
         self._show_recent_images_allow_gif = self._cfg_bool(
             "show_recent_images_allow_gif", False
         )
@@ -1667,7 +1683,7 @@ class Main(ImageReferenceAPI, star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.8.0"
+        version = "3.10.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -4033,7 +4049,14 @@ class Main(ImageReferenceAPI, star.Star):
                     "content": snapshot.bot_last_content,
                 }
 
-            participants = list({m.sender_name for m in flow if not m.is_bot})
+            show_sender_id = self._show_sender_id and not event.is_private_chat()
+            participants = list(
+                {
+                    self._scene_generator.format_sender(m, show_sender_id)
+                    for m in flow
+                    if not m.is_bot
+                }
+            )
 
             scene = self._scene_generator.generate(
                 trigger_type=trigger_type,
@@ -4050,6 +4073,7 @@ class Main(ImageReferenceAPI, star.Star):
                 image_flow=image_flow,
                 voice_flow=voice_flow,
                 private_chat=event.is_private_chat(),
+                show_sender_id=show_sender_id,
             )
 
             # 注入场景描述到请求（v3.0.0: 防止重复注入）
