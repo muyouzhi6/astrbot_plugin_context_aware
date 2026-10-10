@@ -1,0 +1,9 @@
+[ContextAware] Recall image load failed: id=ca_62d4523ead7240f3 source=local_or_inline error=FileNotFoundError
+Executing <Task pending name='Task-1' coro=<IsolatedAsyncioTestCase._asyncioLoopRunner() running at /workspace/tasks/20261010-gh-issues/w-astrbot_plugin_context_aware/scratch/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/unittest/async_case.py:101> wait_for=<Future pending cb=[Task.task_wakeup()] created at /workspace/tasks/20261010-gh-issues/w-astrbot_plugin_context_aware/scratch/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/asyncio/base_events.py:429> created at /workspace/tasks/20261010-gh-issues/w-astrbot_plugin_context_aware/scratch/python/cpython-3.10-linux-x86_64-gnu/lib/python3.10/unittest/async_case.py:117> took 0.759 seconds
+[ContextAware] Recall image load failed: id=ca_565f3086c6ab407e source=local_or_inline error=ValueError
+[ContextAware] Recall image load failed: id=ca_c5a07c9b76994044 source=local_or_inline error=ValueError
+[ContextAware] Recall image load failed: id=ca_3451b6da08d24426 source=local_or_inline error=UnidentifiedImageError
+----------------------------------------------------------------------
+Ran 5 tests in 0.980s
+
+OK

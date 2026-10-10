@@ -38,11 +38,12 @@ MIB = 1024 * 1024
 def _local_image_path(source: str) -> str:
     if not source.lower().startswith("file://"):
         return source
+    if os.name == "nt" and re.match(r"^[A-Za-z]:\\", source[7:]):
+        return nturl2path.url2pathname(source[7:].replace("\\", "/"))
     parsed = urlsplit(source)
     if os.name == "nt":
         path = parsed.path
         if parsed.netloc and parsed.netloc.lower() != "localhost":
-            # Adapters also send file://C:\path, whose drive is in netloc.
             path = parsed.netloc + path
             if not re.match(r"^[A-Za-z]:", parsed.netloc):
                 path = "//" + path  # Preserve UNC server/share names.

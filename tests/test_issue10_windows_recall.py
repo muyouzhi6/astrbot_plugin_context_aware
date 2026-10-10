@@ -26,6 +26,11 @@ class WindowsRecallTests(unittest.IsolatedAsyncioTestCase):
             ("file:////server/share/a.png", r"\\server\share\a.png"),
             ("file:///C:/%E5%9B%BE%E7%89%87/a%23b%25c.png", r"C:\图片\a#b%c.png"),
             ("file:///C:/a%2520b.png", r"C:\a%20b.png"),
+            (r"file://C:\图片#1.jpg", r"C:\图片#1.jpg"),
+            (r"file://C:\图片?1.jpg", r"C:\图片?1.jpg"),
+            (r"FILE://c:\图片%23a#b?c.jpg", r"C:\图片#a#b?c.jpg"),
+            ("file:///C:/images/a%23b.jpg?download=1#preview", r"C:\images\a#b.jpg"),
+            ("file://server/share/a%23b.jpg?download=1#preview", r"\\server\share\a#b.jpg"),
             (r"C:\images\a%20b.png", r"C:\images\a%20b.png"),
             (r"\\server\share\a.png", r"\\server\share\a.png"),
         )
@@ -37,7 +42,6 @@ class WindowsRecallTests(unittest.IsolatedAsyncioTestCase):
     async def test_windows_file_uris_reach_the_correct_file(self):
         index = ImageIndex()
         self.addAsyncCleanup(index.close)
-        expected = r"C:\图片\test image.png"
         raw = png()
 
         def windows_open(path, mode):
@@ -49,9 +53,12 @@ class WindowsRecallTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mode, "rb")
             return io.BytesIO(raw)
 
-        for source in (
-            "file:///C:/%E5%9B%BE%E7%89%87/test%20image.png",
-            r"file://C:\图片\test image.png",
+        for source, expected in (
+            ("file:///C:/%E5%9B%BE%E7%89%87/test%20image.png", r"C:\图片\test image.png"),
+            (r"file://C:\图片\test image.png", r"C:\图片\test image.png"),
+            (r"file://C:\图片#1.png", r"C:\图片#1.png"),
+            (r"file://C:\图片?1.png", r"C:\图片?1.png"),
+            ("file:///C:/%E5%9B%BE%E7%89%87/a%23b.png?x=1#view", r"C:\图片\a#b.png"),
         ):
             with self.subTest(source=source):
                 with (
@@ -80,13 +87,13 @@ class WindowsRecallTests(unittest.IsolatedAsyncioTestCase):
             })
             plugin._recall_supports_vision = lambda event: True
             try:
-                for i, source in enumerate((
-                    "file:///C:/images/test%20image.png",
-                    r"file://C:\images\test image.png",
-                    "file://server/share/test%20image.png",
+                for i, (source, expected) in enumerate((
+                    ("file:///C:/images/test%20image.png", r"C:\images\test image.png"),
+                    (r"file://C:\images\test image.png", r"C:\images\test image.png"),
+                    ("file://server/share/test%20image.png", r"\\server\share\test image.png"),
+                    (r"file://C:\images\photo#1.png", r"C:\images\photo#1.png"),
+                    (r"file://C:\images\photo?1.png", r"C:\images\photo?1.png"),
                 )):
-                    expected = r"C:\images\test image.png" if i < 2 else r"\\server\share\test image.png"
-
                     def windows_open(path, mode):
                         self.assertEqual(ntpath.normpath(str(path)), expected)
                         return io.BytesIO(png())

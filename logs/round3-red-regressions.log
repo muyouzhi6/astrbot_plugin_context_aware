@@ -1,0 +1,105 @@
+[ContextAware] Recall image load failed: id=ca_11865a985ae449cc source=local_or_inline error=FileNotFoundError
+Executing <Task pending name='Task-2' coro=<WindowsRecallTests.test_missing_malformed_and_oversized_images_keep_chat_working() running at /workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py:171> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /usr/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()] created at /usr/lib/python3.13/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /usr/lib/python3.13/asyncio/base_events.py:181] created at /usr/lib/python3.13/asyncio/runners.py:100> took 0.696 seconds
+[ContextAware] Recall image load failed: id=ca_f101b5752af344e4 source=local_or_inline error=ValueError
+[ContextAware] Recall image load failed: id=ca_c714ad7eaae7491b source=local_or_inline error=ValueError
+[ContextAware] Recall image load failed: id=ca_a673e345ad964ef5 source=local_or_inline error=UnidentifiedImageError
+[ContextAware] Recall image load failed: id=ca_fdfb03b435df48b2 source=local_or_inline error=AssertionError
+======================================================================
+ERROR: test_windows_file_uris_reach_the_correct_file (test_issue10_windows_recall.WindowsRecallTests.test_windows_file_uris_reach_the_correct_file) (source='file://C:\\图片#1.png')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 68, in test_windows_file_uris_reach_the_correct_file
+    self.assertEqual(await index._fetch(source), raw)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/image_context.py", line 457, in _fetch
+    data = await asyncio.to_thread(read_local)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/image_context.py", line 454, in read_local
+    with Path(path).open("rb") as handle:
+         ~~~~~~~~~~~~~~~^^^^^^
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 52, in windows_open
+    raise OSError(22, "Invalid argument", actual)
+OSError: [Errno 22] Invalid argument: 'C:\\图片'
+
+======================================================================
+ERROR: test_windows_file_uris_reach_the_correct_file (test_issue10_windows_recall.WindowsRecallTests.test_windows_file_uris_reach_the_correct_file) (source='file://C:\\图片?1.png')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 68, in test_windows_file_uris_reach_the_correct_file
+    self.assertEqual(await index._fetch(source), raw)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/image_context.py", line 457, in _fetch
+    data = await asyncio.to_thread(read_local)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/concurrent/futures/thread.py", line 59, in run
+    result = self.fn(*self.args, **self.kwargs)
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/image_context.py", line 454, in read_local
+    with Path(path).open("rb") as handle:
+         ~~~~~~~~~~~~~~~^^^^^^
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 52, in windows_open
+    raise OSError(22, "Invalid argument", actual)
+OSError: [Errno 22] Invalid argument: 'C:\\图片'
+
+======================================================================
+FAIL: test_windows_message_llm_and_tool_lifecycle (test_issue10_windows_recall.WindowsRecallTests.test_windows_message_llm_and_tool_lifecycle)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.13/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/usr/lib/python3.13/asyncio/base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 114, in test_windows_message_llm_and_tool_lifecycle
+    self.assertEqual(plugin._image_index.resources[ids[0]].data, png())
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: b'' != b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x[185 chars]\x82'
+
+======================================================================
+FAIL: test_windows_path_matrix (test_issue10_windows_recall.WindowsRecallTests.test_windows_path_matrix) (source='file://C:\\图片#1.jpg')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 40, in test_windows_path_matrix
+    self.assertEqual(_local_image_path(source), expected)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'C:\\图片' != 'C:\\图片#1.jpg'
+- C:\图片
++ C:\图片#1.jpg
+
+
+======================================================================
+FAIL: test_windows_path_matrix (test_issue10_windows_recall.WindowsRecallTests.test_windows_path_matrix) (source='file://C:\\图片?1.jpg')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 40, in test_windows_path_matrix
+    self.assertEqual(_local_image_path(source), expected)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'C:\\图片' != 'C:\\图片?1.jpg'
+- C:\图片
++ C:\图片?1.jpg
+
+
+======================================================================
+FAIL: test_windows_path_matrix (test_issue10_windows_recall.WindowsRecallTests.test_windows_path_matrix) (source='FILE://c:\\图片%23a#b?c.jpg')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py", line 40, in test_windows_path_matrix
+    self.assertEqual(_local_image_path(source), expected)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'C:\\图片#a' != 'C:\\图片#a#b?c.jpg'
+- C:\图片#a
++ C:\图片#a#b?c.jpg
+
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.925s
+
+FAILED (failures=4, errors=2)

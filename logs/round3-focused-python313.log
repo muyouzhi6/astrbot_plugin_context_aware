@@ -1,0 +1,9 @@
+[ContextAware] Recall image load failed: id=ca_d3c2cd3c520f4d02 source=local_or_inline error=FileNotFoundError
+Executing <Task pending name='Task-2' coro=<WindowsRecallTests.test_missing_malformed_and_oversized_images_keep_chat_working() running at /workspace/tasks/20261010-gh-issues/repos/astrbot_plugin_context_aware/tests/test_issue10_windows_recall.py:171> wait_for=<Future pending cb=[shield.<locals>._outer_done_callback() at /usr/lib/python3.13/asyncio/tasks.py:975, Task.task_wakeup()] created at /usr/lib/python3.13/asyncio/base_events.py:459> cb=[_run_until_complete_cb() at /usr/lib/python3.13/asyncio/base_events.py:181] created at /usr/lib/python3.13/asyncio/runners.py:100> took 0.559 seconds
+[ContextAware] Recall image load failed: id=ca_32db541c69744090 source=local_or_inline error=ValueError
+[ContextAware] Recall image load failed: id=ca_2cb90897eb31417b source=local_or_inline error=ValueError
+[ContextAware] Recall image load failed: id=ca_422d5ee4f07e494c source=local_or_inline error=UnidentifiedImageError
+----------------------------------------------------------------------
+Ran 5 tests in 0.768s
+
+OK
