@@ -20,15 +20,17 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import urlsplit
 
 from PIL import Image
 
 try:
     from .gif_frames import GifOptions, number, render_frames
+    from .image_context import _local_image_path
     from .model_capability import detect_video_capability, video_family
 except ImportError:
     from gif_frames import GifOptions, number, render_frames
+    from image_context import _local_image_path
     from model_capability import detect_video_capability, video_family
 
 MIB = 1024 * 1024
@@ -110,9 +112,10 @@ def is_video_component(component):
     if str(getattr(component, "mime_type", "")).startswith("video/"):
         return True
     return any(
-        Path(urlsplit(str(_source_value(component, attr) or "")).path).suffix.lower()
+        Path(_local_image_path(ref) if ref.lower().startswith("file://") else urlsplit(ref).path).suffix.lower()
         in VIDEO_SUFFIXES
         for attr in ("name", "file", "file_", "url", "path")
+        for ref in (str(_source_value(component, attr) or ""),)
     )
 
 
@@ -142,9 +145,9 @@ def video_source(component):
     refs = [_source_value(component, attr) for attr in ("path", "file_", "file", "url")]
     refs = [ref for ref in refs if isinstance(ref, str) and ref]
     for ref in refs:
-        if urlsplit(ref).scheme not in ("", "file"):
+        if urlsplit(ref).scheme not in ("", "file") and not re.match(r"^[A-Za-z]:[\\/]", ref):
             continue
-        path = unquote(urlsplit(ref).path) if ref.startswith("file://") else ref
+        path = _local_image_path(ref)
         try:
             if Path(path).is_file():
                 return path
@@ -162,8 +165,8 @@ def downloaded_video_paths(req, directory):
     for text in texts:
         if not isinstance(text, str):
             continue
-        for ref in re.findall(r"(?:file://)?/[^\s\"'<>\[\]]*media_video_[\w.-]+", text[:16000]):
-            path = Path(unquote(urlsplit(ref).path) if ref.startswith("file://") else ref)
+        for ref in re.findall(r"(?:file://|[A-Za-z]:[\\/]|/|\\\\)[^\s\"'<>\[\]]*media_video_[\w.-]+", text[:16000], re.I):
+            path = Path(_local_image_path(ref))
             try:
                 if (path.name.startswith("media_video_") and path.suffix.lower() in VIDEO_SUFFIXES
                         and path.resolve().is_relative_to(root) and path.is_file()):
@@ -410,8 +413,8 @@ async def _materialize(source, directory, options):
         )
         await _worker(target.write_bytes, data)
         return str(target)
-    path = unquote(urlsplit(source).path) if source.startswith("file://") else source
-    if urlsplit(source).scheme not in ("", "file"):
+    path = _local_image_path(source)
+    if urlsplit(source).scheme not in ("", "file") and not re.match(r"^[A-Za-z]:[\\/]", source):
         raise ValueError("unsupported video URL")
     if not Path(path).is_file() or Path(path).stat().st_size > options.max_bytes:
         raise ValueError("video source unavailable or oversized")

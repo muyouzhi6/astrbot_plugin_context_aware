@@ -144,6 +144,7 @@ try:
         SNAPSHOT_KEY,
         TOOL_NAME,
         ImageIndex,
+        _local_image_path,
         select_automatic,
         strip_tool_images,
     )
@@ -156,6 +157,7 @@ except ImportError:
         SNAPSHOT_KEY,
         TOOL_NAME,
         ImageIndex,
+        _local_image_path,
         select_automatic,
         strip_tool_images,
     )
@@ -464,17 +466,13 @@ def _image_ref_looks_like_gif(image_ref: str) -> bool:
     if ref_without_query.endswith(".gif"):
         return True
 
-    local_path = ref
-    if lowered.startswith("file:///"):
-        local_path = ref[8:]
-    elif lowered.startswith("file://"):
-        local_path = ref[7:]
-    if "://" not in local_path and not lowered.startswith(("data:", "base64:")):
-        try:
+    try:
+        local_path = _local_image_path(ref)
+        if "://" not in local_path and not lowered.startswith(("data:", "base64:")):
             with open(local_path, "rb") as f:
                 return f.read(6) in (b"GIF87a", b"GIF89a")
-        except OSError:
-            pass
+    except (OSError, ValueError):
+        pass
 
     payload = ref
     lowered_payload = payload.lower()
@@ -2394,9 +2392,7 @@ class Main(ImageReferenceAPI, star.Star):
 
         # 已经是本地文件路径：复制到缓存目录持久化，避免被临时文件清理删掉
         if not image_url.startswith("http"):
-            local_ref = image_url
-            if image_url.startswith("file://"):
-                local_ref = urllib.parse.unquote(image_url.removeprefix("file://"))
+            local_ref = _local_image_path(image_url)
             if os.path.exists(local_ref):
                 if os.path.getsize(local_ref) > effective_limit:
                     return None
@@ -2618,9 +2614,7 @@ class Main(ImageReferenceAPI, star.Star):
                 "path": "",
             }
         else:
-            local_ref = image_ref
-            if image_ref.startswith("file://"):
-                local_ref = urllib.parse.unquote(image_ref.removeprefix("file://"))
+            local_ref = _local_image_path(image_ref)
             local_path = Path(local_ref).resolve(strict=False)
             replacements = {
                 "file": local_path.as_uri(),
@@ -2682,11 +2676,9 @@ class Main(ImageReferenceAPI, star.Star):
 
     async def _materialize_image_for_compression(self, image_ref: str) -> str | None:
         options = self._image_compress_options
-        if image_ref.startswith("file://"):
-            local_path = urllib.parse.unquote(image_ref.removeprefix("file://"))
-            return local_path if os.path.isfile(local_path) else None
         if not image_ref.startswith(("http://", "https://", "data:", "base64://")):
-            return image_ref if os.path.isfile(image_ref) else None
+            local_path = _local_image_path(image_ref)
+            return local_path if os.path.isfile(local_path) else None
         if image_ref.startswith(("http://", "https://")) and await asyncio.to_thread(_image_ref_looks_like_gif, image_ref):
             # New GIF fetching uses the public-address/redirect-checked reader.
             # Keep the pre-existing static-image downloader and cache semantics.
@@ -2903,7 +2895,7 @@ class Main(ImageReferenceAPI, star.Star):
             await self._prepare_event_images_for_llm(event)
         if isinstance(image_urls, list):
             def identity(ref):
-                return urllib.parse.unquote(urllib.parse.urlsplit(ref).path) if ref.startswith("file://") else ref
+                return _local_image_path(ref)
 
             known = {identity(ref) for ref in image_urls if isinstance(ref, str)}
             for part in getattr(req, "extra_user_content_parts", []) or []:
@@ -2984,10 +2976,8 @@ class Main(ImageReferenceAPI, star.Star):
                             prepared_content.append(part)
                             continue
                     local_ref: str | None = None
-                    if image_ref.startswith("file://"):
-                        local_ref = urllib.parse.unquote(
-                            image_ref.removeprefix("file://")
-                        )
+                    if image_ref.lower().startswith("file://"):
+                        local_ref = _local_image_path(image_ref)
                     elif image_ref.startswith("base64:") and not image_ref.startswith(
                         "base64://"
                     ):
@@ -3022,9 +3012,7 @@ class Main(ImageReferenceAPI, star.Star):
                     if note:
                         prepared_content.append({"type": "text", "text": note})
                     for index, ref in enumerate(refs):
-                        data_uri_source = ref
-                        if ref.startswith("file://"):
-                            data_uri_source = urllib.parse.unquote(ref.removeprefix("file://"))
+                        data_uri_source = _local_image_path(ref)
                         if os.path.isfile(data_uri_source):
                             ref = await asyncio.to_thread(self._local_path_to_data_uri, data_uri_source)
                             if not ref:
