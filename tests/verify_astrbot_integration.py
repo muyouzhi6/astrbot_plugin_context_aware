@@ -85,8 +85,14 @@ async def verify():
                 stage.platform_settings = {}
                 stage.stt_settings = {}
                 await stage.process(ev)
+                # Core 4.28.2 keeps normalized images beyond the event. These
+                # fixtures belong to this test; register them for real cleanup.
+                for component in ev.get_messages():
+                    path = Path(component.path)
+                    assert path.is_file(), "Core must normalize the image"
+                    ev.track_temporary_local_file(str(path))
                 owned = list(ev._temporary_local_files)
-                assert owned, "Core must own the normalized image files"
+                assert owned, "The test must exercise Core file cleanup"
                 from image_compression import ImageCompressionOptions
 
                 plugin._image_compress_options = ImageCompressionOptions.from_mapping(

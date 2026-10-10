@@ -506,6 +506,53 @@ class MockGeminiProvider(MockChatProvider):
         return await self.client.models.generate_content(model=payloads["model"], contents=contents)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_gemini_conversation_preserves_provider_call_contract(asynchronous):
+    import copy
+    import inspect
+
+    provider = MockGeminiProvider()
+
+    def prepare(payload, *, marker):
+        assert marker == "forwarded"
+        return [SimpleNamespace(parts=[
+            SimpleNamespace(text=part["text"])
+            for part in payload["messages"][0]["content"]
+        ])]
+
+    async def prepare_async(payload, **kwargs):
+        return prepare(payload, **kwargs)
+
+    original = prepare_async if asynchronous else prepare
+    provider._prepare_conversation = original
+    adapter = MainVideoAdapter(provider, VideoOptions(), GifOptions())
+    assert adapter.install()
+    payload = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "解释视频"},
+        {"type": "context_aware_video", "token": "test-token", "part": {
+            "inline_data": {"mime_type": "video/mp4", "data": b"video bytes"},
+        }},
+    ]}]}
+    before = copy.deepcopy(payload)
+    try:
+        result = provider._prepare_conversation(payload, marker="forwarded")
+        if inspect.isawaitable(result) != asynchronous:
+            if inspect.iscoroutine(result):
+                result.close()
+            pytest.fail("Gemini conversation wrapper changed the provider call contract")
+        if asynchronous:
+            result = await result
+        assert result[0].parts[0].text == "解释视频"
+        assert result[0].parts[1].inline_data == {
+            "mime_type": "video/mp4", "data": b"video bytes",
+        }
+        assert payload == before
+    finally:
+        adapter.close()
+    assert provider._prepare_conversation is original
+
+
 def plugin_request(tmp_path, provider, config=None, model=None):
     from test_llm_image_compression import FakeCompressionEvent, FakeContext, load_plugin_module
     module = load_plugin_module()
@@ -1196,7 +1243,8 @@ async def _verify_real_astrbot(video, root):
     from astrbot.api.message_components import At, File, Reply, Video
     import main
 
-    assert version("astrbot") == "4.28.2"
+    framework_version = version("astrbot")
+    assert framework_version in ("4.26.8", "4.27.3", "4.28.2")
     cases = [
         ("gpt-4o", "frames", False, False),
         ("gpt-4o", "frames", True, False),
@@ -1298,24 +1346,58 @@ async def _verify_real_astrbot(video, root):
                     assert base64.b64decode(encoded.split(",", 1)[-1]) == video.read_bytes()
                 if reject:
                     assert all(p["type"] == "text" for p in seen[-1])
+            if gemini:
+                # Older Core also calls the synchronous hook from its stream path.
+                previous = list(seen)
+                seen.clear()
+
+                async def stream(**kwargs):
+                    response = await create(**kwargs)
+
+                    async def chunks():
+                        yield response
+
+                    return chunks()
+
+                runner.streaming = True
+                with patch.object(sdk, "generate_content_stream", AsyncMock(side_effect=stream)):
+                    replies = [reply async for reply in runner._iter_llm_responses()]
+                assert replies[-1].completion_text == "verified"
+                assert seen == previous
         finally:
             await plugin.terminate()
             assert provider._query == original_query
             event.cleanup_temporary_local_files()
             await provider.terminate()
-    print("PASS real AstrBot 4.28.2: 16 provider/Core scenarios")
+    print(f"PASS real AstrBot {framework_version}: 16 provider/Core scenarios")
+    print("PASS real Gemini streams: 4 native/frame/rejection/quoted scenarios")
 
 
-def test_real_astrbot_4282_core_and_providers(video, tmp_path):
+@pytest.mark.parametrize("framework_version", ["4.26.8", "4.27.3", "4.28.2"])
+def test_real_astrbot_core_and_providers(video, tmp_path, framework_version):
+    import json
     import os
     import sys
 
-    interpreter = os.environ.get("ASTRBOT_TEST_PYTHON", sys.executable)
-    check = subprocess.run([interpreter, "-c", "from importlib.metadata import version; assert version('astrbot') == '4.28.2'"], capture_output=True, timeout=10)
-    if check.returncode:
-        pytest.skip("使用装有 AstrBot 4.28.2 的 ASTRBOT_TEST_PYTHON 运行真实框架集成测试")
+    variable = "ASTRBOT_TEST_PYTHON_" + framework_version.replace(".", "")
+    configured = os.environ.get(variable)
+    if framework_version == "4.28.2":
+        configured = configured or os.environ.get("ASTRBOT_TEST_PYTHON")
+    interpreter = configured or sys.executable
+    probe = "import json, sys; from importlib.metadata import version; print(json.dumps([version('astrbot'), list(sys.version_info[:2])]))"
+    check = subprocess.run([interpreter, "-c", probe], capture_output=True, text=True, timeout=10)
+    if not configured and (check.returncode or json.loads(check.stdout)[0] != framework_version):
+        pytest.skip(f"使用 {variable} 指定 AstrBot {framework_version} 的解释器")
+    assert check.returncode == 0, check.stderr
+    installed, python_version = json.loads(check.stdout)
+    assert installed == framework_version
+    if framework_version == "4.26.8":
+        assert python_version == [3, 12], "部署版本须用 Python 3.12 验证"
     repo = Path(__file__).resolve().parents[1]
-    script = "import asyncio, runpy, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); module = runpy.run_path(sys.argv[2]); asyncio.run(module['_verify_real_astrbot'](Path(sys.argv[3]), Path.cwd()))"
+    script = "import asyncio, runpy, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); module = runpy.run_path(sys.argv[2]); asyncio.run(module['_verify_real_astrbot'](Path(sys.argv[3]), Path.cwd())); core = runpy.run_path(str(Path(sys.argv[2]).with_name('verify_astrbot_integration.py'))); asyncio.run(core['verify']())"
     result = subprocess.run([interpreter, "-c", script, str(repo), str(Path(__file__).resolve()), str(video)], cwd=tmp_path, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS real AstrBot 4.28.2: 16" in result.stdout
+    assert f"PASS real AstrBot {framework_version}: 16" in result.stdout
+    assert "PASS actual tool loop delivers image" in result.stdout
+    print(f"AstrBot {installed}, Python {'.'.join(map(str, python_version))}")
+    print(result.stdout)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import inspect
 import json
 import math
 import mimetypes
@@ -755,7 +756,7 @@ class MainVideoAdapter:
                         message["content"] = [p for p in content if p.get("type") == "video_url"] + [p for p in content if p.get("type") != "video_url"]
             yield prepared
 
-    async def conversation(self, payload, *args, **kwargs):
+    def conversation(self, payload, *args, **kwargs):
         native = {}
         clean = {**payload, "messages": copy.deepcopy(payload.get("messages", []))}
         for message in clean["messages"]:
@@ -765,14 +766,23 @@ class MainVideoAdapter:
                 if isinstance(part, dict) and part.get("type") == "context_aware_video":
                     native[part["token"]] = part["part"]
                     message["content"][index] = {"type": "text", "text": part["token"]}
-        conversation = await self.originals["_prepare_conversation"](clean, *args, **kwargs)
-        for content in conversation:
-            for index, part in enumerate(content.parts or []):
-                token = getattr(part, "text", None)
-                if token in native:
-                    # SDK Part accepts inline_data/file_data; no image decoding.
-                    content.parts[index] = type(part)(**native[token])
-        return conversation
+        def restore(conversation):
+            for content in conversation:
+                for index, part in enumerate(content.parts or []):
+                    token = getattr(part, "text", None)
+                    if token in native:
+                        # SDK Part accepts inline_data/file_data; no image decoding.
+                        content.parts[index] = type(part)(**native[token])
+            return conversation
+
+        conversation = self.originals["_prepare_conversation"](clean, *args, **kwargs)
+        # AstrBot 4.26.8/4.27.3 call synchronously; 4.28.2 awaits this hook.
+        if inspect.isawaitable(conversation):
+            async def finish():
+                return restore(await conversation)
+
+            return finish()
+        return restore(conversation)
 
     async def _frames(self, payload, plans):
         replacements = {}

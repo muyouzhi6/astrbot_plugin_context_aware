@@ -162,6 +162,7 @@ class WindowsImagePipelineTests(unittest.IsolatedAsyncioTestCase):
             "file://C:\\系统\\AstrBot\\图片%20%23%20%2520.jpg",
             PureWindowsPath(self.unc).as_uri(),
             PureWindowsPath(self.source).as_uri().replace("file:", "FILE:"),
+            "file://" + self.source.replace("%", "%25"),
         )
 
     def event(self, message_id, components=None, text=""):
@@ -313,6 +314,9 @@ class WindowsImagePipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_path_compression_produces_recallable_history_uri(self):
         await self.check_compression_lifecycle(self.source)
+
+    async def test_adapter_literal_hash_survives_compression_and_recall(self):
+        await self.check_compression_lifecycle(self.sources[-1])
 
     async def check_compression_lifecycle(self, source):
         # Keep compression and default automatic recall enabled throughout.
