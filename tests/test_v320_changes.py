@@ -488,7 +488,7 @@ class V320ChangesTest(unittest.TestCase):
 
         event = FakeEvent()
         event.mod = self.mod
-        message = asyncio.run(plugin._extract_message_with_caption(event))
+        message = asyncio.run(plugin._extract_message_with_caption(event, analyzer))
 
         self.assertTrue(message.at_all)
         trigger, _ = analyzer.detect_trigger(event, message)

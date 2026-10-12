@@ -8,12 +8,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.10", "3.12", "3.13"]
+        python: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install -r requirements.txt ruff
-      - run: python -m unittest discover -s tests -q
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -r requirements-test.txt ruff 'astrbot @ git+https://github.com/AstrBotDevs/AstrBot.git@v4.29.0-beta.2'
+      - run: python -m pytest -q tests
       - run: ruff check .

@@ -95,7 +95,28 @@ class VideoResult:
     family: str = ""
     origin: str = field(default="", repr=False)
     transcript: str = field(default="", repr=False)
+    question: str = field(default="", repr=False)
     token: str = field(default_factory=lambda: "[context-aware-video:" + uuid.uuid4().hex + "]")
+
+
+class VideoAdapterUnavailable(ValueError):
+    """The local provider exposes no SDK interface for native video."""
+
+
+class VideoPreparationError(ValueError):
+    """Local media preparation failed before an upstream request."""
+
+
+class VideoFileProcessingError(ValueError):
+    """Gemini accepted the upload but could not process the media."""
+
+
+class VideoProviderError(Exception):
+    """Carry an upstream error through preprocessing without logging its body."""
+
+    def __init__(self, original):
+        super().__init__(type(original).__name__)
+        self.original = original
 
 
 def _source_value(component, attr):
@@ -206,10 +227,11 @@ class RecentVideos:
 
     def latest(self, origin, message_id, now=None):
         self._expire(time.monotonic() if now is None else now)
+        candidates = []
         for previous_id, _, videos in reversed(self.sessions.get(origin, ())):
             if previous_id != message_id and videos:
-                return list(videos[:1])
-        return []
+                candidates.extend(videos)
+        return candidates
 
 
 async def _worker(function, *args):
@@ -281,7 +303,7 @@ def probe_video(path, options, deadline):
 def extract_video_frames(path, duration, options, gif_options, directory, deadline):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
-        return ()
+        raise ValueError('ffmpeg missing')
     images, times = [], []
     limits = replace(
         gif_options,
@@ -417,8 +439,10 @@ async def _materialize(source, directory, options):
     path = _local_image_path(source)
     if urlsplit(source).scheme not in ("", "file") and not re.match(r"^[A-Za-z]:[\\/]", source):
         raise ValueError("unsupported video URL")
-    if not Path(path).is_file() or Path(path).stat().st_size > options.max_bytes:
-        raise ValueError("video source unavailable or oversized")
+    if not Path(path).is_file():
+        raise ValueError('video source unavailable')
+    if Path(path).stat().st_size > options.max_bytes:
+        raise ValueError('video source bytes')
     return path
 
 
@@ -434,11 +458,21 @@ def _model(provider, model):
 
 
 def _read_bounded(path, limit):
-    with open(path, "rb") as handle:
-        data = handle.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError("video bytes changed")
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError("video bytes changed")
+    except (OSError, ValueError) as exc:
+        raise VideoPreparationError(str(exc)) from exc
     return data
+
+
+def _native_video_size(path):
+    try:
+        return Path(path).stat().st_size
+    except OSError as exc:
+        raise VideoPreparationError(str(exc)) from exc
 
 
 def openai_video_part(data, mime, family):
@@ -472,7 +506,7 @@ async def gemini_video_part(provider, path, options, envelope_size=0):
     )
     uploaded = None
     try:
-        if _inline(Path(path).stat().st_size, options, envelope_size):
+        if _inline(_native_video_size(path), options, envelope_size):
             data = await _worker(_read_bounded, path, options.inline_max_bytes)
             yield {"inline_data": {"mime_type": mime, "data": data}}
         else:
@@ -483,6 +517,8 @@ async def gemini_video_part(provider, path, options, envelope_size=0):
             while _file_state(uploaded) == "PROCESSING":
                 await asyncio.sleep(1)
                 uploaded = await files.get(name=uploaded.name)
+            if _file_state(uploaded) == "FAILED":
+                raise VideoFileProcessingError("uploaded video processing failed")
             if _file_state(uploaded) != "ACTIVE" or not getattr(uploaded, "uri", None):
                 raise ValueError("uploaded video not active")
             yield {"file_data": {"mime_type": mime, "file_uri": uploaded.uri}}
@@ -516,13 +552,13 @@ async def describe_native(provider, path, options, prompt, model=""):
             )
             text = getattr(response, "text", "")
     else:
-        if not _inline(Path(path).stat().st_size, options, len(prompt.encode())):
+        if not _inline(_native_video_size(path), options, len(prompt.encode())):
             raise ValueError("compat provider has no Gemini Files API")
         create = getattr(
             getattr(getattr(client, "chat", None), "completions", None), "create", None
         )
         if not callable(create):
-            raise ValueError("compat client unavailable")
+            raise VideoAdapterUnavailable("compat client unavailable")
         data = await _worker(_read_bounded, path, options.inline_max_bytes)
         mime = mimetypes.guess_type(path)[0] or "video/mp4"
         config = getattr(provider, "provider_config", {}) or {}
@@ -562,10 +598,14 @@ async def understand_video(
         {"video_mode": options.mode},
     )
     if capability == "none" and (
-        not transcriber or options.audio_transcribe == "off" or not transcriber.available(origin)
+        not transcriber or options.audio_transcribe == "off" or not await transcriber.available(origin)
     ):
-        return VideoResult(text=NO_VISION, reason="none")
+        note = ""
+        if re.search(r"声音|语音|说了什么|讲了什么|唱了什么|什么歌|sound|audio", str(question), re.I):
+            note = "\n请开启视频语音识别并配置 STT 服务后重试声音问题。"
+        return VideoResult(text=NO_VISION + note, reason="none")
     transcript = ""
+    provider_error = None
     try:
         with tempfile.TemporaryDirectory(prefix="context-aware-video-") as directory:
             path = await _materialize(source, directory, options)
@@ -580,15 +620,16 @@ async def understand_video(
                 except Exception:
                     native_path = path
             if capability == "native":
+                if for_main:
+                    data = await _worker(_read_bounded, native_path, options.max_bytes)
+                    return VideoResult(
+                        text="", reason="native_main", video=data,
+                        mime=mimetypes.guess_type(native_path)[0] or "video/mp4",
+                        family=video_family(_model(provider, model), config.get("id", "")),
+                        origin=origin,
+                        question=str(question),
+                    )
                 try:
-                    if for_main:
-                        data = await _worker(_read_bounded, native_path, options.max_bytes)
-                        return VideoResult(
-                            text="", reason="native_main", video=data,
-                            mime=mimetypes.guess_type(native_path)[0] or "video/mp4",
-                            family=video_family(_model(provider, model), config.get("id", "")),
-                            origin=origin,
-                        )
                     prompt = (
                         "请描述视频的动作、事件顺序、画面文字和声音；关键事件标注时间。结合用户问题提供可核对的观察。\n用户问题："
                         + str(question)[:4000]
@@ -598,13 +639,30 @@ async def understand_video(
                         options.timeout_sec,
                     )
                     return VideoResult(text="[视频观察]\n" + text, reason="native")
-                except Exception:
-                    pass  # Do not log provider errors containing request media/auth.
+                except VideoAdapterUnavailable:
+                    # No upstream request was made; retain STT and frame fallback.
+                    pass
+                except VideoPreparationError:
+                    raise
+                except Exception as exc:
+                    if not is_media_rejection(exc):
+                        provider_error = exc
+                        raise
             if transcriber:
                 try:
                     transcript = await transcriber.transcribe(path, duration, options, origin)
                 except Exception:
                     pass
+            sound_note = ""
+            if not transcript and re.search(r"声音|语音|说了什么|讲了什么|唱了什么|什么歌|sound|audio", str(question), re.I):
+                reason = getattr(transcript, "reason", "no_provider")
+                sound_note = {
+                    "no_provider": "请在 AstrBot 配置语音识别服务后重试声音问题。",
+                    "disabled": "视频语音识别已关闭，请开启后重试声音问题。",
+                    "no_audio": "视频没有音轨。",
+                }.get(reason, "未取得语音转写，请稍后重试或提供字幕。")
+            if sound_note:
+                transcript = sound_note
             if capability == "none":
                 return VideoResult(text=NO_VISION + ("\n" + transcript if transcript else ""),
                                    reason="none", transcript=transcript)
@@ -613,8 +671,8 @@ async def understand_video(
                     extract_video_frames, path, duration, options, gif_options, directory,
                     time.monotonic() + min(30, options.timeout_sec),
                 )
-            except Exception:
-                images = ()
+            except Exception as exc:
+                return video_failure(exc, transcript)
             if images:
                 layout = "，分别附图" if len(images) > 1 else "拼成网格"
                 return VideoResult(
@@ -623,10 +681,47 @@ async def understand_video(
                     reason="frames",
                     transcript=transcript,
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        if provider_error is not None:
+            raise VideoProviderError(provider_error) from provider_error
+        return video_failure(exc, transcript)
     note = NO_VISION if capability == "none" else UNPARSED
     return VideoResult(text=note + ("\n" + transcript if transcript else ""), transcript=transcript)
+
+
+def video_failure(exc, transcript=''):
+    reason, note = {
+        'ffprobe missing': ('missing_ffprobe', '请在 AstrBot 运行环境安装 ffprobe 后重试。'),
+        'ffmpeg missing': ('missing_ffmpeg', '请在 AstrBot 运行环境安装 ffmpeg 后重试。'),
+        'video source bytes': ('too_large', '视频过大，请压缩后重发。'),
+        'video bytes changed': ('too_large', '视频过大，请压缩后重发。'),
+        'image exceeds download limit': ('too_large', '视频过大，请压缩后重发。'),
+        'video duration': ('too_long', '视频时长不符合设置，请剪短后重发。'),
+    }.get(str(exc), ('decode_failed', '视频解析失败，请转为 MP4 后重发。'))
+    if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+        reason, note = 'timeout', '视频下载或处理超时，请稍后重试或发送较小的视频。'
+    return VideoResult(text=note + ('\n' + transcript if transcript else ''),
+                       reason=reason, transcript=transcript)
+
+
+def is_media_rejection(exc):
+    status = getattr(exc, 'status_code', None)
+    if not isinstance(status, int):
+        status = getattr(exc, 'code', None)
+    if status in (401, 403, 402, 429) or (isinstance(status, int) and status >= 500):
+        return False
+    if isinstance(exc, VideoFileProcessingError):
+        return True
+    message = str(exc).lower()
+    return any(term in message for term in (
+        'unsupported video', 'video is not supported', 'does not support video',
+        'unsupported image', 'image is not supported', 'does not support image',
+        'unsupported modality', 'unsupported media', 'unsupported mime', 'invalid video format',
+        'files api unavailable', 'compat provider has no gemini files api',
+        'compat inline request limit', 'frames-only video plan',
+        'invalid image format', 'invalid image_url',
+        'media rejected', 'reject video', 'reject frames', 'frames rejected',
+    ))
 
 
 class MainVideoAdapter:
@@ -796,6 +891,7 @@ class MainVideoAdapter:
                         source, None, replace(self.options, mode="frames"), self.gif_options,
                         capability="frames",
                         transcriber=self.transcriber, origin=result.origin,
+                        question=result.question,
                     )
                 parts = [{"type": "text", "text": fallback.text}]
                 for data, mime in fallback.images:
@@ -818,6 +914,7 @@ class MainVideoAdapter:
                     fallback = await understand_video(
                         source, None, self.options, self.gif_options, capability="none",
                         transcriber=self.transcriber, origin=result.origin,
+                        question=result.question,
                     )
             except Exception:
                 pass
@@ -843,12 +940,15 @@ class MainVideoAdapter:
         if capability == "native":
             try:
                 return await asyncio.wait_for(native(), self.options.timeout_sec)
-            except Exception:
-                pass  # Provider exceptions may include media/credentials; do not log.
+            except Exception as exc:
+                if not is_media_rejection(exc):
+                    raise
         frames, textual = await self._frames(payload, plans)
         try:
             return await original(frames, *args, **kwargs)
-        except Exception:
+        except Exception as exc:
+            if not is_media_rejection(exc):
+                raise
             return await original(textual, *args, **kwargs)
 
     async def query_stream(self, payload, *args, **kwargs):
@@ -887,11 +987,15 @@ class MainVideoAdapter:
                 raise ValueError("frames-only request model")
             # Buffer this video's stream so a late rejection cannot duplicate output.
             responses = await asyncio.wait_for(native(), self.options.timeout_sec)
-        except Exception:
+        except Exception as exc:
+            if capability == 'native' and not is_media_rejection(exc):
+                raise
             frames, textual = await self._frames(payload, plans)
             try:
                 responses = await collect(frames)
-            except Exception:
+            except Exception as exc:
+                if not is_media_rejection(exc):
+                    raise
                 responses = await collect(textual)
         for response in responses:
             yield response

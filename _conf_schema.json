@@ -1,9 +1,9 @@
 {
   "enable": {
-    "description": "启用上下文增强",
+    "description": "场景与话题增强",
     "type": "bool",
     "default": true,
-    "hint": "控制群聊场景、私聊场景及私聊话题摘要。LLM 请求图片压缩使用独立开关。"
+    "hint": "控制群聊、私聊场景及话题摘要。视频理解和静态图片压缩使用独立开关；GIF 仍按 gif_mode 处理。完全停止处理请禁用插件。"
   },
   "bot_names": {
     "description": "Bot 昵称列表",
@@ -15,13 +15,13 @@
     "description": "场景历史消息上限",
     "type": "int",
     "default": 50,
-    "hint": "每个场景会话保留的消息数量。用于群聊及已启用场景提示的私聊；不控制独立的私聊话题摘要数据库。"
+    "hint": "每个场景会话保留的消息数量，最小有效值 10。启用群聊摘要时，max(触发条数, 保留条数+6) 不得超过本项；触发最少 10 条、保留最少 5 条。不控制私聊话题摘要数据库。"
   },
   "max_groups": {
     "description": "场景会话缓存上限",
     "type": "int",
     "default": 100,
-    "hint": "超出上限时淘汰最久未使用的场景会话，限制内存占用。"
+    "hint": "最小有效值 10。超出上限时淘汰最久未使用的场景会话，限制内存占用。"
   },
   "dialogue_window": {
     "description": "对话流分析窗口（消息数）",
@@ -287,14 +287,15 @@
     "description": "指定视频语音识别服务",
     "type": "string",
     "default": "",
-    "invisible": true,
+    "_special": "select_provider_stt",
+    "condition": {"video_understanding_enabled": true},
     "hint": "留空自动使用当前会话或全局语音识别服务，再尝试第一个已启用的服务。"
   },
   "video_capability_override": {
     "description": "GIF 与视频能力覆盖",
     "type": "string",
     "default": "auto",
-    "invisible": true,
+    "condition": {"video_understanding_enabled": true},
     "hint": "auto 按覆盖列表、Provider modalities 与模型家族判定。native 原生视频、frames 图片抽帧、none 文本提示；非 auto 优先级最高。旧 video_mode=frames/native 在 auto 下继续生效。",
     "options": [
       "auto",
@@ -603,6 +604,8 @@
         "description": "备用摘要模型列表",
         "type": "list",
         "default": [],
+        "_special": "select_providers",
+        "condition": {"provider_mode": "单独指定"},
         "hint": "选择「单独指定」时使用。填写 AstrBot 模型配置中的完整 Provider ID，按列表顺序尝试；留空表示不使用备用模型。"
       },
       "content_refusal_policy": {

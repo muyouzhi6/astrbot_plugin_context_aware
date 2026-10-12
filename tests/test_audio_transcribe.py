@@ -41,21 +41,22 @@ def stt_context(stt=None):
     )
 
 
-def test_select_stt_global_first_then_first_enabled_and_old_provider_id():
+@pytest.mark.asyncio
+async def test_select_stt_global_first_then_first_enabled_and_old_provider_id():
     global_stt = SimpleNamespace(get_text=AsyncMock(), provider_config={"enable": True})
     disabled = SimpleNamespace(get_text=AsyncMock(), provider_config={"enable": False})
     fallback = SimpleNamespace(get_text=AsyncMock(), provider_config={"enable": True})
     context = stt_context(global_stt)
     context.get_all_stt_providers = lambda: [disabled, fallback]
-    assert select_stt_provider(context, "room") is global_stt
+    assert await select_stt_provider(context, "room") is global_stt
     context.get_using_stt_provider = Mock(return_value=disabled)
-    assert select_stt_provider(context, "room") is fallback
+    assert await select_stt_provider(context, "room") is fallback
     context.get_using_stt_provider.assert_called_with(umo="room")
     context.get_provider_by_id = lambda name: global_stt if name == "legacy" else None
-    assert select_stt_provider(context, "room", "legacy") is global_stt
-    assert select_stt_provider(context, "room", "missing") is fallback
+    assert await select_stt_provider(context, "room", "legacy") is global_stt
+    assert await select_stt_provider(context, "room", "missing") is fallback
     context.get_all_stt_providers = lambda: [disabled, SimpleNamespace()]
-    assert select_stt_provider(context, "room") is None
+    assert await select_stt_provider(context, "room") is None
 
 
 @pytest.mark.asyncio

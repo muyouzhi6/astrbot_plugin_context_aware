@@ -513,6 +513,13 @@ class TopicMemory:
         await self.start(run_worker=False)
         return await self.store.run(Store.last_injection, umo, cid)
 
+    async def status(self, umo, cid):
+        await self.start(run_worker=False)
+        def read(db):
+            row = db.execute("SELECT error,next_try FROM sessions WHERE umo=? AND cid=?", (umo, cid)).fetchone()
+            return tuple(row) if row else ("", 0)
+        return await self.store.run(read)
+
     async def save_injection(self, receipt, text):
         return await self.store.run(Store.save_injection, receipt, text)
 

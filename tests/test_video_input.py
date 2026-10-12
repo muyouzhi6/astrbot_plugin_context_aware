@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from packaging.version import Version
 from PIL import Image
 
 from gif_frames import GifOptions
@@ -30,9 +31,11 @@ from video_input import (
 
 
 @pytest.fixture
-def video(tmp_path):
+def video(tmp_path, request):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not shutil.which("ffprobe"):
+        if "4.29.0-beta.2" in request.node.nodeid:
+            pytest.fail("必跑框架验证需要 ffmpeg 和 ffprobe")
         pytest.skip("ffmpeg/ffprobe 未安装，跳过真实 MP4 验证")
     path = tmp_path / "sample.mp4"
     subprocess.run(
@@ -166,6 +169,192 @@ async def test_native_timeout_cleans_uploaded_file(video):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("poll", [False, True])
+@pytest.mark.parametrize("route", ["backup", "main", "stream"])
+@pytest.mark.parametrize("status", [None, 401, 429, 503])
+async def test_gemini_file_processing_failure_routes(video, poll, route, status):
+    from video_input import VideoProviderError, VideoResult
+
+    provider = MockGeminiProvider()
+    files = provider.client.files
+    failed = SimpleNamespace(name="files/test", state=SimpleNamespace(name="FAILED"))
+    files.upload.return_value = (
+        SimpleNamespace(name=failed.name, state="PROCESSING") if poll else failed
+    )
+    files.get.return_value = failed
+    error = None
+    if status is not None:
+        error = RuntimeError("unsupported video")
+        error.status_code = status
+        (files.get if poll else files.upload).side_effect = error
+    transcriber = SimpleNamespace(transcribe=AsyncMock(return_value="spoken words"))
+    options = VideoOptions(inline_max_bytes=1, fallback_frames=3)
+    adapter = MainVideoAdapter(provider, options, GifOptions(), transcriber=transcriber)
+    plan = VideoResult(video=video.read_bytes(), family="gemini")
+    assert adapter.install()
+    token = adapter.register(plan)
+    payload = {"model": provider.model, "messages": [
+        {"role": "user", "content": [{"type": "text", "text": token}]}
+    ]}
+    sent = []
+
+    async def stream_original(prepared):
+        sent.append(prepared)
+        yield SimpleNamespace(text="complete", is_chunk=False)
+
+    adapter.originals["_query_stream"] = stream_original
+
+    async def run():
+        if route == "backup":
+            return await understand_video(str(video), provider, options, transcriber=transcriber)
+        if route == "main":
+            return await adapter.query(payload)
+        return [chunk async for chunk in adapter.query_stream(payload)]
+
+    try:
+        with patch("video_input.asyncio.sleep", new=AsyncMock()), patch(
+            "video_input.extract_video_frames", wraps=__import__("video_input").extract_video_frames
+        ) as frames:
+            if status is not None:
+                with pytest.raises(VideoProviderError if route == "backup" else RuntimeError):
+                    await run()
+                transcriber.transcribe.assert_not_awaited()
+                frames.assert_not_called()
+                provider.client.models.generate_content.assert_not_awaited()
+                assert not sent
+            else:
+                result = await run()
+                transcriber.transcribe.assert_awaited_once()
+                frames.assert_called_once()
+                if route == "backup":
+                    assert result.reason == "frames" and result.images
+                    assert result.transcript == "spoken words"
+                    provider.client.models.generate_content.assert_not_awaited()
+                elif route == "main":
+                    provider.client.models.generate_content.assert_awaited_once()
+                    contents = provider.client.models.generate_content.call_args.kwargs["contents"]
+                    assert any(getattr(part, "inline_data", {}).get("mime_type", "").startswith("image/") for part in contents[-1].parts)
+                    assert any("spoken words" in getattr(part, "text", "") for part in contents[-1].parts)
+                else:
+                    assert len(result) == len(sent) == 1
+                    parts = sent[0]["messages"][-1]["content"]
+                    assert any(part["type"] == "image_url" for part in parts)
+                    assert any("spoken words" in part.get("text", "") for part in parts)
+        files.upload.assert_awaited_once()
+        assert files.get.await_count == int(poll)
+        if status is None or poll:
+            files.delete.assert_awaited_once_with(name=failed.name)
+        else:
+            files.delete.assert_not_awaited()
+    finally:
+        adapter.close()
+
+@pytest.mark.asyncio
+async def test_sound_question_explains_missing_stt_but_visual_question_does_not(video):
+    options = VideoOptions(mode="frames")
+    sound = await understand_video(str(video), None, options, capability="frames", question="说了什么？")
+    visual = await understand_video(str(video), None, options, capability="frames", question="画面是什么？")
+    assert sound.images and "配置语音识别" in sound.text
+    assert visual.images and "配置语音识别" not in visual.text
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client", [None, SimpleNamespace(), SimpleNamespace(
+    chat=SimpleNamespace(completions=SimpleNamespace(create=None))
+)])
+@pytest.mark.parametrize("frames_fail", [False, True])
+async def test_native_missing_sdk_retains_stt_and_frame_fallback(video, client, frames_fail):
+    provider = SimpleNamespace(client=client, get_model=lambda: "gemini-2.5-flash")
+    transcriber = SimpleNamespace(transcribe=AsyncMock(return_value="视频语音转写"))
+    frames = [(b"frame", "image/jpeg")]
+    with patch(
+        "video_input.extract_video_frames",
+        return_value=frames,
+        side_effect=ValueError("decode failed") if frames_fail else None,
+    ) as extract:
+        result = await understand_video(
+            str(video), provider, VideoOptions(), transcriber=transcriber, origin="test-session"
+        )
+    transcriber.transcribe.assert_awaited_once()
+    assert transcriber.transcribe.call_args.args[-1] == "test-session"
+    extract.assert_called_once()
+    assert result.transcript == "视频语音转写"
+    assert "视频语音转写" in result.text
+    if frames_fail:
+        assert result.reason == "decode_failed"
+        assert "视频解析失败" in result.text
+    else:
+        assert result.reason == "frames" and result.images == frames
+        assert "已按时间顺序抽取" in result.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('for_main', [False, True])
+@pytest.mark.parametrize('provider_factory', [native_provider, compat_provider])
+@pytest.mark.parametrize('failure', ['missing', 'permission', 'grown'])
+async def test_native_local_read_failure_is_media_failure(video, for_main, provider_factory, failure):
+    provider = provider_factory()
+    def fail_read(*args, **kwargs):
+        if failure == 'grown':
+            return io.BytesIO(b'x' * (VideoOptions().max_bytes + 1))
+        raise (FileNotFoundError if failure == 'missing' else PermissionError)('local file')
+    with patch('builtins.open', side_effect=fail_read):
+        result = await understand_video(str(video), provider, VideoOptions(), for_main=for_main)
+    assert result.reason == ('too_large' if failure == 'grown' else 'decode_failed')
+    assert not result.video
+    if hasattr(provider.client, 'models'):
+        provider.client.models.generate_content.assert_not_awaited()
+    else:
+        provider.client.chat.completions.create.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 429, 503])
+async def test_native_auxiliary_service_error_is_not_media_failure(video, status):
+    from video_input import VideoProviderError
+    provider = native_provider()
+    error = RuntimeError("service unavailable")
+    error.status_code = status
+    provider.client.models.generate_content.side_effect = error
+    transcriber = SimpleNamespace(transcribe=AsyncMock())
+    with pytest.raises(VideoProviderError) as caught, patch("video_input.extract_video_frames") as extract:
+        await understand_video(str(video), provider, VideoOptions(), transcriber=transcriber)
+    assert caught.value.original is error
+    assert provider.client.models.generate_content.await_count == 1
+    transcriber.transcribe.assert_not_awaited()
+    extract.assert_not_called()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 429, 503])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_adapter_service_error_does_not_retry(video, status, stream):
+    from video_input import VideoResult
+    provider = MockChatProvider("qwen3-vl")
+    failure = RuntimeError("unsupported video")
+    failure.status_code = status
+    calls = []
+    async def query(payload, *args, **kwargs):
+        calls.append(payload)
+        raise failure
+    async def query_stream(payload, *args, **kwargs):
+        yield await query(payload)
+    provider._query, provider._query_stream = query, query_stream
+    adapter = MainVideoAdapter(provider, VideoOptions(), GifOptions())
+    assert adapter.install()
+    token = adapter.register(VideoResult(video=video.read_bytes(), family="qwen"))
+    payload = {"model": "qwen3-vl", "messages": [{"role": "user", "content": [{"type": "text", "text": token}]}]}
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            if stream:
+                _ = [chunk async for chunk in provider._query_stream(payload)]
+            else:
+                await provider._query(payload)
+        assert caught.value is failure
+        assert len(calls) == 1
+    finally:
+        adapter.close()
+
+
+@pytest.mark.asyncio
 async def test_compat_video_mime_and_fallback(video):
     provider = compat_provider()
     result = await understand_video(str(video), provider, VideoOptions(enabled=True))
@@ -174,7 +363,7 @@ async def test_compat_video_mime_and_fallback(video):
     url = create.call_args.kwargs["messages"][0]["content"][0]["image_url"]["url"]
     assert url.startswith("data:video/mp4;base64,")
     assert base64.b64decode(url.split(",", 1)[1]) == video.read_bytes()
-    create.side_effect = ValueError("400 unknown input type")
+    create.side_effect = ValueError("unsupported video input type")
     result = await understand_video(str(video), provider, VideoOptions(enabled=True))
     assert result.reason == "frames"
 
@@ -219,12 +408,12 @@ async def test_limits_corruption_and_missing_binaries(video, tmp_path):
         VideoOptions(enabled=True, max_duration_sec=0.1),
     ):
         result = await understand_video(str(video), native_provider(), options)
-        assert result.text == UNPARSED
+        assert result.reason in ('too_large', 'too_long')
     bad = tmp_path / "bad.mp4"
     bad.write_bytes(b"broken video")
     assert (
         await understand_video(str(bad), None, VideoOptions(enabled=True))
-    ).text == UNPARSED
+    ).reason == 'decode_failed'
     actual = shutil.which
     with patch(
         "video_input.shutil.which",
@@ -232,11 +421,11 @@ async def test_limits_corruption_and_missing_binaries(video, tmp_path):
     ):
         assert (
             await understand_video(str(video), None, VideoOptions(enabled=True))
-        ).text == UNPARSED
+        ).reason == 'missing_ffmpeg'
     with patch("video_input.shutil.which", return_value=None):
         assert (
             await understand_video(str(video), None, VideoOptions(enabled=True))
-        ).text == UNPARSED
+        ).reason == 'missing_ffprobe'
 
 
 @pytest.mark.asyncio
@@ -340,7 +529,7 @@ async def test_plugin_disabled_and_hook_injection(video, tmp_path):
         plugin._video_options = VideoOptions(enabled=True, mode="frames")
         provider = MockChatProvider("gpt-4o")
         plugin._context.get_using_provider = lambda **kw: provider
-        plugin._recall_supports_vision = lambda ev: True
+        plugin._recall_supports_vision = AsyncMock(return_value=True)
         await plugin.on_llm_request(event, req)
         assert not req.image_urls
         await run_chat(provider, req)
@@ -388,7 +577,7 @@ async def test_remote_private_address_is_rejected():
     result = await understand_video(
         "http://127.0.0.1/private.mp4", None, VideoOptions(enabled=True)
     )
-    assert result.text == UNPARSED and not result.images
+    assert result.reason == 'decode_failed' and not result.images
 
 
 @pytest.mark.asyncio
@@ -655,7 +844,7 @@ async def test_quoted_private_url_fails_silently_without_component_downloader(tm
     event.get_messages = lambda: [reply]
     try:
         await plugin.on_llm_request(event, req)
-        assert [p.text for p in req.extra_user_content_parts] == [UNPARSED]
+        assert [p.text for p in req.extra_user_content_parts] == ['视频解析失败，请转为 MP4 后重发。']
         assert await run_chat(provider, req)
         component.get_file.assert_not_awaited()
     finally:
@@ -663,7 +852,26 @@ async def test_quoted_private_url_fails_silently_without_component_downloader(tm
 
 
 @pytest.mark.asyncio
-async def test_at_bot_recalls_latest_same_session_video_without_context_feature(video, tmp_path):
+@pytest.mark.parametrize('error', [FileNotFoundError('gone'), PermissionError('denied'), ValueError('video bytes changed')])
+async def test_main_video_read_failure_keeps_request_running(video, tmp_path, error):
+    provider = MockChatProvider('qwen3-vl')
+    module, plugin, event, req = plugin_request(tmp_path, provider)
+    attach_video(event, video)
+    event.stop_event = AsyncMock()
+    try:
+        with patch('video_input._read_bounded', side_effect=error):
+            await plugin.on_llm_request(event, req)
+        event.stop_event.assert_not_called()
+        assert any('视频解析失败' in p.text or '视频过大' in p.text for p in req.extra_user_content_parts)
+        assert await run_chat(provider, req)
+        provider.client.chat.completions.create.assert_awaited_once()
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('question', ['说了什么？', '刚才的视频讲了什么？', '看看这个视频', '视频里发生了什么', 'Describe this video'])
+async def test_at_bot_recalls_latest_same_session_video_without_context_feature(video, tmp_path, question):
     from test_llm_image_compression import FakeCompressionEvent
 
     provider = MockChatProvider("gpt-4o")
@@ -672,9 +880,17 @@ async def test_at_bot_recalls_latest_same_session_video_without_context_feature(
     event = FakeCompressionEvent(private=True)
     event.get_messages = lambda: [module.At("bot")]
     event.get_self_id = lambda: "bot"
-    req = SimpleNamespace(prompt="说了什么？", image_urls=[], extra_user_content_parts=[])
+    req = SimpleNamespace(prompt=question, image_urls=[], extra_user_content_parts=[])
     try:
         await plugin.on_message(previous)
+        for prompt in ['今天天气怎么样？', '推荐几个视频剪辑软件', '怎么压缩视频',
+                       '不要分析视频，回答今天天气', '别看刚才的视频',
+                       '不用分析这个视频说了什么', "Do not analyze this video"]:
+            weather = SimpleNamespace(prompt=prompt, image_urls=[], extra_user_content_parts=[])
+            with patch("video_input._materialize") as materialize:
+                await plugin.on_llm_request(event, weather)
+            materialize.assert_not_called()
+            assert not weather.extra_user_content_parts
         await plugin.on_llm_request(event, req)
         assert req.extra_user_content_parts
         await run_chat(provider, req)
@@ -692,11 +908,69 @@ async def test_at_bot_recalls_latest_same_session_video_without_context_feature(
         await plugin.terminate()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('question', [
+    '这个视频怎么压缩？', '这个视频用什么软件剪辑？',
+    '不要看，告诉我刚才发生了什么', '别看，说了什么？',
+    '无需观看，告诉我发生了什么', '不用分析，刚才发生了什么？',
+    '这个视频如何转码？', '这个视频的剪辑软件推荐一下',
+    '怎样下载这个视频？', '这个视频用哪个工具裁剪？',
+    'How can I compress this video?', 'What software can edit this clip?',
+    "Don't watch, tell me what happened in this video",
+])
+async def test_implicit_video_recall_excludes_operations_and_denials(video, tmp_path, question):
+    from test_llm_image_compression import FakeCompressionEvent
+
+    module, plugin, previous, _ = plugin_request(tmp_path, MockChatProvider('gpt-4o'))
+    attach_video(previous, video)
+    event = FakeCompressionEvent(private=True)
+    event.get_messages = lambda: [module.At('bot')]
+    event.get_self_id = lambda: 'bot'
+    req = SimpleNamespace(prompt=question, image_urls=[], extra_user_content_parts=[])
+    try:
+        await plugin.on_message(previous)
+        with patch.object(plugin, '_media_capability', new_callable=AsyncMock) as capability, \
+             patch.object(module, 'understand_video', new_callable=AsyncMock) as understand, \
+             patch('video_input._materialize') as materialize:
+            await plugin._prepare_request_videos(event, req)
+        capability.assert_not_awaited()
+        understand.assert_not_awaited()
+        materialize.assert_not_called()
+        assert not req.extra_user_content_parts
+        assert not req.image_urls
+    finally:
+        await plugin.terminate()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('quoted', [False, True])
+async def test_explicit_video_keeps_priority_over_implicit_intent_filter(video, tmp_path, quoted):
+    module, plugin, event, req = plugin_request(tmp_path, MockChatProvider('gpt-4o'))
+    attach_video(event, video)
+    if quoted:
+        reply = module.Reply()
+        reply.chain = event.get_messages()
+        event.get_messages = lambda: [reply]
+    req.prompt = '这个视频怎么压缩？'
+    try:
+        with patch.object(module, 'understand_video', new_callable=AsyncMock,
+                          return_value=module.VideoResult(text='explicit video')) as understand:
+            await plugin._prepare_request_videos(event, req)
+        understand.assert_awaited_once()
+        assert any(p.text == 'explicit video' for p in req.extra_user_content_parts)
+    finally:
+        await plugin.terminate()
+
+
 def test_recent_videos_message_window_time_window_session_cap_and_no_reply_refresh():
     history = RecentVideos()
     video = type("Video", (), {})()
     history.record("room", "first", [video], now=0)
     assert history.latest("room", "next", now=119) == [video]
+    second = type("Video", (), {})()
+    history.record("room", "second", [second], now=119)
+    assert len(history.latest("room", "next", now=119)) == 2
+    history.sessions["room"].pop()
     assert history.latest("other", "next", now=119) == []
     assert history.latest("room", "next", now=121) == []
     history.record("room", "first", [video], now=122)
@@ -945,7 +1219,7 @@ async def test_stream_late_failure_has_no_partial_output_and_no_shared_mutation(
         seen.append(payloads)
         if any(p.get("type") == "video_url" for p in payloads["messages"][0]["content"]):
             yield "discard partial video output"
-            raise ValueError("late native error")
+            raise ValueError("unsupported video format after partial output")
         yield "frames answer"
 
     provider._query_stream = stream
@@ -995,7 +1269,7 @@ async def test_gemini_main_upload_failure_uses_frame_images(video, tmp_path):
     provider = MockGeminiProvider()
     _, plugin, event, req = plugin_request(tmp_path, provider)
     plugin._video_options = replace(plugin._video_options, inline_max_bytes=1)
-    provider.client.files.upload.side_effect = ValueError("upload rejected")
+    provider.client.files.upload.side_effect = ValueError("unsupported video format")
     attach_video(event, video)
     try:
         await plugin.on_llm_request(event, req)
@@ -1244,7 +1518,7 @@ async def _verify_real_astrbot(video, root):
     import main
 
     framework_version = version("astrbot")
-    assert framework_version in ("4.26.8", "4.27.3", "4.28.2")
+    assert Version(framework_version) in map(Version, ("4.26.8", "4.27.3", "4.28.2", "4.29.0-beta.2"))
     cases = [
         ("gpt-4o", "frames", False, False),
         ("gpt-4o", "frames", True, False),
@@ -1373,31 +1647,36 @@ async def _verify_real_astrbot(video, root):
     print("PASS real Gemini streams: 4 native/frame/rejection/quoted scenarios")
 
 
-@pytest.mark.parametrize("framework_version", ["4.26.8", "4.27.3", "4.28.2"])
+@pytest.mark.parametrize("framework_version", ["4.26.8", "4.27.3", "4.28.2", "4.29.0-beta.2"])
 def test_real_astrbot_core_and_providers(video, tmp_path, framework_version):
     import json
     import os
     import sys
 
     variable = "ASTRBOT_TEST_PYTHON_" + framework_version.replace(".", "")
+    if framework_version == "4.29.0-beta.2":
+        variable = "ASTRBOT_TEST_PYTHON_4290b2"
     configured = os.environ.get(variable)
     if framework_version == "4.28.2":
         configured = configured or os.environ.get("ASTRBOT_TEST_PYTHON")
     interpreter = configured or sys.executable
     probe = "import json, sys; from importlib.metadata import version; print(json.dumps([version('astrbot'), list(sys.version_info[:2])]))"
     check = subprocess.run([interpreter, "-c", probe], capture_output=True, text=True, timeout=10)
-    if not configured and (check.returncode or json.loads(check.stdout)[0] != framework_version):
+    if framework_version == "4.29.0-beta.2":
+        assert check.returncode == 0, '必跑目标 AstrBot 4.29.0b2 未安装，请设置 ASTRBOT_TEST_PYTHON_4290b2'
+        assert Version(json.loads(check.stdout)[0]) == Version(framework_version), '必跑目标解释器版本不符'
+    if not configured and (check.returncode or Version(json.loads(check.stdout)[0]) != Version(framework_version)):
         pytest.skip(f"使用 {variable} 指定 AstrBot {framework_version} 的解释器")
     assert check.returncode == 0, check.stderr
     installed, python_version = json.loads(check.stdout)
-    assert installed == framework_version
+    assert Version(installed) == Version(framework_version)
     if framework_version == "4.26.8":
         assert python_version == [3, 12], "部署版本须用 Python 3.12 验证"
     repo = Path(__file__).resolve().parents[1]
     script = "import asyncio, runpy, sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); module = runpy.run_path(sys.argv[2]); asyncio.run(module['_verify_real_astrbot'](Path(sys.argv[3]), Path.cwd())); core = runpy.run_path(str(Path(sys.argv[2]).with_name('verify_astrbot_integration.py'))); asyncio.run(core['verify']())"
     result = subprocess.run([interpreter, "-c", script, str(repo), str(Path(__file__).resolve()), str(video)], cwd=tmp_path, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert f"PASS real AstrBot {framework_version}: 16" in result.stdout
+    assert f"PASS real AstrBot {installed}: 16" in result.stdout
     assert "PASS actual tool loop delivers image" in result.stdout
     print(f"AstrBot {installed}, Python {'.'.join(map(str, python_version))}")
     print(result.stdout)

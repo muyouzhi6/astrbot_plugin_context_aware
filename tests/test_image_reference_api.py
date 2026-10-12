@@ -115,7 +115,9 @@ class ReferenceAPITests(unittest.IsolatedAsyncioTestCase):
     async def test_text_only_model_receives_edit_catalog_without_vision(self):
         await self.add_source()
         event = self.event()
-        self.plugin._recall_supports_vision = lambda e: False
+        async def no_vision(event):
+            return False
+        self.plugin._recall_supports_vision = no_vision
         request = SimpleNamespace(
             extra_user_content_parts=[],
             system_prompt="",

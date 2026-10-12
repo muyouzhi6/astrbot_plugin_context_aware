@@ -226,7 +226,7 @@ class LLMImageCompressionIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 with patch.object(plugin, "_download_image_to_local", side_effect=AssertionError):
                     await plugin.on_llm_request(event, req)
                     await plugin.on_llm_request(event, req)
-                self.assertEqual(req.image_urls, [str(source)])
+                self.assertEqual([str(Path(p).resolve()) for p in req.image_urls], [str(source.resolve())])
                 self.assertEqual(plugin._image_compress_count, 0)
             finally:
                 await plugin.terminate()

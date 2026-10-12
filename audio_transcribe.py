@@ -24,7 +24,7 @@ def _enabled(provider):
             and config.get("enabled", True) is not False)
 
 
-def select_stt_provider(context, origin, provider_id=""):
+async def select_stt_provider(context, origin, provider_id=""):
     if provider_id:
         try:
             provider = context.get_provider_by_id(provider_id)
@@ -33,7 +33,8 @@ def select_stt_provider(context, origin, provider_id=""):
         except Exception:
             pass
     try:
-        provider = context.get_using_stt_provider(umo=origin)
+        getter = getattr(context, 'get_using_stt_provider_async', None)
+        provider = await getter(umo=origin) if callable(getter) else context.get_using_stt_provider(umo=origin)
         if _enabled(provider):
             return provider
     except Exception:
@@ -84,6 +85,13 @@ def _digest(path, max_bytes):
     return digest.hexdigest()
 
 
+class Transcript(str):
+    def __new__(cls, text="", reason="ok"):
+        result = super().__new__(cls, text)
+        result.reason = reason
+        return result
+
+
 class AudioTranscriber:
     def __init__(self, context, config=None, *, timeout_sec=25):
         self.context = context
@@ -92,15 +100,15 @@ class AudioTranscriber:
         self.cache = OrderedDict()
         self.semaphore = asyncio.Semaphore(1)
 
-    def available(self, origin):
-        return select_stt_provider(self.context, origin, self.provider_id) is not None
+    async def available(self, origin):
+        return await select_stt_provider(self.context, origin, self.provider_id) is not None
 
     async def transcribe(self, path, duration, options, origin=""):
         if options.audio_transcribe == "off":
-            return ""
-        provider = select_stt_provider(self.context, origin, self.provider_id)
+            return Transcript(reason="disabled")
+        provider = await select_stt_provider(self.context, origin, self.provider_id)
         if provider is None:
-            return ""
+            return Transcript(reason="no_provider")
         seconds = min(duration, options.max_duration_sec)
         if seconds <= 0:
             return ""
@@ -118,14 +126,16 @@ class AudioTranscriber:
                 if key in self.cache:
                     self.cache.move_to_end(key)
                     return self.cache[key][0]
-                text = ""
+                text = Transcript(reason="no_audio")
                 if await _worker(has_audio, path, deadline):
                     with tempfile.TemporaryDirectory(prefix="context-aware-audio-") as directory:
                         target = Path(directory) / "audio.wav"
                         await _worker(extract_audio, path, target, seconds, deadline)
                         transcript = await provider.get_text(str(target))
                         if isinstance(transcript, str) and transcript.strip():
-                            text = f"[视频语音转写，约 {seconds:.0f} 秒] " + transcript.strip()[:2000]
+                            text = Transcript(f"[视频语音转写，约 {seconds:.0f} 秒] " + transcript.strip()[:2000])
+                        else:
+                            text = Transcript(reason="empty")
                 self._remember(key, text)
                 return text
 
@@ -134,8 +144,8 @@ class AudioTranscriber:
         except Exception:
             # Provider errors and transcripts never enter logs.
             if key is not None:
-                self._remember(key, "")
-            return ""
+                self._remember(key, Transcript(reason="failed"))
+            return Transcript(reason="failed")
 
     def _remember(self, key, text):
         self.cache[key] = (text, time.monotonic())

@@ -77,7 +77,7 @@ def test_schema_retains_hidden_legacy_key_during_default_merge():
 def test_video_panel_exposes_three_simple_defaults_and_keeps_legacy_keys():
     schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())
     visible = {key for key, item in schema.items() if key.startswith("video_") and not item.get("invisible")}
-    assert visible == {"video_understanding_enabled", "video_max_duration_sec", "video_audio_transcribe"}
+    assert visible == {"video_understanding_enabled", "video_max_duration_sec", "video_audio_transcribe", "video_stt_provider_id", "video_capability_override"}
     assert schema["video_understanding_enabled"]["default"] is True
     assert schema["video_max_duration_sec"]["default"] == 120
     assert schema["video_audio_transcribe"]["default"] == "auto"

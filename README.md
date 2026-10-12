@@ -4,47 +4,19 @@
 
 配置面板按群聊场景与历史摘要、图片与语音、私聊场景与话题摘要的顺序排列。功能更新记录见 [CHANGELOG.md](CHANGELOG.md)。
 
-## v3.10.0 更新
+## 安装与使用
 
-- 修复 Windows 本地图片的 `file://` 路径解析，支持盘符和 UNC 共享路径的图片回看。
-- 新增 `show_sender_id`（默认 `false`）。开启「群聊场景发送者显示 ID」后，当前消息、对话流、图片、语音及参与者显示「昵称 (sender_id)」，例如「小明 (123456)」；QQ 平台使用 QQ 号。
+在 AstrBot 插件市场搜索 ContextAware，安装后使用默认配置即可开始群聊场景分析和图片回看。支持 AstrBot >=4.26.8；AstrBot 4.29.0-beta.2 使用 Python 3.12 或更新版本。
 
-## v3.9.0：视频和声音，发来就能看
+1. 群聊中正常 @Bot 提问，插件补充发言对象和近期场景。
+2. 发送图片后问“图里是什么”，或明确引用图片提问；聊天模型需支持图片，按需回看还需启用 context_aware_view_images 工具。
+3. 发送或引用视频提问；无附件时，明确 @Bot 并问视频内容才回看最近 5 条消息、120 秒内的唯一视频，多候选时请引用。问天气等普通问题不会回看视频。
 
-直接发送视频，或引用视频并 @机器人，再问“发生了什么”“视频里说了什么”。只 @机器人提问时，也会寻找同一会话最近 5 条消息、120 秒内的最新视频；本轮已发送或引用的视频优先。
+群聊摘要、私聊话题摘要和图像转述默认关闭，开启后会额外调用模型。视频默认开启；检查时长需要 ffprobe，抽帧、声音提取和转码需要 ffmpeg。请把依赖安装到 **AstrBot 实际运行的容器或环境**，而不是只装在宿主机；Debian/Ubuntu 可执行 `apt-get update && apt-get install -y ffmpeg`。
 
-插件自动跟随聊天模型选择处理方式：
+管理员发送 `/场景状态` 查看当前配置判定的处理方式、STT 选择和依赖。视频过大请压缩，过长请剪短，解析失败请转为 MP4。关闭“场景与话题增强”不关闭视频、GIF 和独立图片压缩；完全停止处理请禁用插件。
 
-| 模型能力 | 处理方式 |
-|---|---|
-| 能直接看视频，如 Gemini | 发送原视频和声音；失败后自动抽帧 |
-| 能看图片 | 按时间抽取画面，配上视频里的语音文字 |
-| 文本模型 | 配上视频里的语音文字和视频提示 |
-
-语音识别自动使用 AstrBot 当前会话或全局配置的 STT 服务，再尝试第一个已启用的服务。没有语音服务或视频没有音轨时，继续使用画面或文字提示；识别失败也继续聊天。插件不下载、不运行本地语音模型。转写最多处理设定时长的前段音频，等待最多 25 秒，保留约 2000 字并缓存；日志不记录转写原文。原生视频成功时直接使用视频声音，不另做转写。
-
-视频面板显示三项：
-
-| 配置项 | 默认值 | 用途 |
-|---|---|---|
-| `video_understanding_enabled` | 开启 | 是否处理视频 |
-| `video_max_duration_sec` | 120 秒 | 接收的视频时长上限 |
-| `video_audio_transcribe` | `auto` | 自动识别说话声；`off` 关闭额外识别 |
-
-模型能力默认自动判断。旧的能力覆盖、模型列表、`video_mode`、抽帧、转码、超时、大小上限和 `video_stt_provider_id` 设置继续读取，面板隐藏这些高级项；保留的强制模式在发送失败后仍会自动回退。
-
-GIF 默认生成带序号和时间的多帧网格，引用里的 GIF 和图片也会进入本次请求。GIF 与静态图片压缩开关独立；`gif_mode` 的 `frames`、`first_frame` 旧设置继续有效。源动图仍用于图片编辑参考。
-
-默认接收 120 秒以内、50 MiB 以内的视频。抽帧和声音提取使用 ffmpeg/ffprobe；超长视频请剪短，超大视频请压缩后再发送。媒体解析或接口失败时，按原视频、抽帧、文字提示依次尝试。下载检查公网地址、重定向与文件大小，优先复用 AstrBot 已下载的本地视频。
-
-验证命令：`python3 -m pytest -q tests`、`python3 -m ruff check .`。测试视频在运行时生成，不提交素材文件。可设置 `ASTRBOT_TEST_PYTHON=/path/to/venv/bin/python`，运行 AstrBot 4.28.2 的真实框架回归。
-
-## v3.7.1 更新
-
-- 私聊发送 `短期记忆`，查看当前会话最近一次请求实际注入的话题摘要和原文补充，不调用模型、不把查看命令记入话题记录。
-- 查看快照按消息来源和 AstrBot conversation ID 隔离，支持重载恢复、reset 清理和长内容分段输出。
-- 可选开启 `private_topic.log_injected_content`，以单行 JSON 记录实际注入正文；默认关闭，开启后日志会包含私聊资料，应限制日志访问和保留时间。
-- 从 v3.7.0 升级保留原有配置和话题数据，无需清空数据库。查看快照从升级后的正常私聊请求开始记录，不会补造历史请求的注入内容。
+更新历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 群聊图片与图像工具联动
 
@@ -60,46 +32,6 @@ GIF 默认生成带序号和时间的多帧网格，引用里的 GIF 和图片�
 本轮目录在请求准备时冻结，工具调用期间的新图不自动加入。调用方应先完成消息记录再获取目录。reset/new、上下文清理或插件重载会使旧目录和结果登记凭据失效；后台任务输入已有独立副本，但旧任务不会把结果重新注册进清空后的上下文。缓存过期的父图片 ID 保留来源记录；重新编辑时请重发原图。
 
 联动当前覆盖 `aiimg_generate` 的单图同步/后台路径；多张参考图可以合用，批量任务逐项引用、命令入口历史选图、重启后恢复图片索引不在本版范围内。需要历史参考的批量请求会明确拒绝，不会省略参考改成纯文生图。
-
-### 开发接口（API v1）
-
-- `get_image_catalog(event)`：当前会话请求快照中的目录。
-- `resolve_reference_images(event, image_ids)`：校验当前快照和 epoch，全部成功才返回 bytes、SHA256 与来源；最多 8 张、单图 20 MiB、合计 64 MiB，独立于聊天看图上限。
-- `capture_image_request(event, conversation_id)`：任务开始前捕获实例与会话凭据。
-- `register_generated_image(receipt, task_id=..., data=..., parent_ids=...)`：已成功交付单图的短期登记；重复任务只能幂等返回同一内容，不能覆盖已公开 ID。
-
-可在真实 AstrBot 环境运行 `python tests/verify_two_plugin_bridge.py /path/to/context_plugin /path/to/gitee_plugin`，验证预处理清理、跨用户取图、任务输入副本、自拍参考与结果接续。该集成使用替代的生图/发送函数，不会向群发图或调用付费生图。
-
-### v3.5.1 生命周期修复
-
-修复 v3.5.0 在真实群聊中“索引有图片，但工具返回 0 张图片”的问题：AstrBot 会在消息结束时清理预处理生成的临时文件，现在插件会在事件结束前把本地图片接管到有界内存缓存。远程 URL 仍采用后台预取，本地接管每条消息最多等待 3 秒。
-
-升级后请使用新发送的图片验证；旧版本已经丢失的临时图片无法恢复。
-
-### v3.5.0 新增能力
-
-新增“先发图、后提问”的上下文看图能力：明确场景自动带入近期单图，复杂指代通过工具按需读取。图片缓存有界，自动图片临时注入，工具图片在下一轮退出视觉历史。详见下方“上下文按需看图”。
-
-### 保留的图片兼容能力（v3.4.x）
-
-- 历史图片预处理后保持为自包含 `data URI`，不会把短期缓存路径写回持久化会话。
-- 自动移除会话中已经失效的本地图片引用，单张过期图片不再拖垮整轮 LLM 请求。
-- 图片组件使用正确的 `file URI`/本地 `path` 语义，并复用规范化路径避免重复压缩。
-- 持久化会话历史中的图片也会进入 LLM 请求图片预处理，不再只处理当前消息和引用消息。
-- GIF 在单次 LLM 请求中按 `gif_mode` 生成 PNG/JPEG 视觉副本，兼容图片模型。
-- 引用消息中的图片文件会按真实内容归一化为 `Image`, 避免 Core 再次回查 OneBot。
-- 自动支持 Pillow 可识别的 PNG、JPEG/JPG、WebP、GIF、BMP、TIFF、ICO 等图片格式。
-- 伪图片后缀和损坏文件保持原 `File`, 不会阻断正常消息处理。
-- 新增可选的 LLM 请求图片压缩, 仅生成临时副本, 不修改原图。
-- 支持按文件大小或最长边触发, 并可调 JPEG 质量、最低质量、目标输出大小和输入上限。
-- QQ CDN 图片下载增加完整性校验、指数退避重试和短时失败缓存, 减少引用大图时的下载中断。
-- 修复 `/new` 和 `/reset` 后插件上下文未清理的问题, 覆盖第三方 Agent runner。
-- 兼容 AstrBot 当前的 `_clean_group_context_session` 信号, 并保留旧版 `_clean_ltm_session` 兼容。
-- 兼容 `astrbot_plugin_cmdmask` 的伪装指令, 根据插件提供的真实 target 清理上下文。
-
-**让你的 Bot 在群聊中不再"抢答"别人的问题**
-
----
 
 ## 上下文按需看图
 
@@ -129,8 +61,8 @@ GIF 默认生成带序号和时间的多帧网格，引用里的 GIF 和图片�
 ### 开发验证
 
 ```bash
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -q
+python -m pip install -r requirements-test.txt
+ASTRBOT_TEST_PYTHON_4290b2=/path/to/astrbot-4.29-venv/bin/python python -m pytest -q tests
 ruff check .
 ```
 
@@ -138,18 +70,18 @@ ruff check .
 
 ## 版本要求
 
-需要 AstrBot `>=4.26.8`（本次集成验证版本）。本插件会把场景提示标记为临时内容，避免动态上下文被写入会话历史。
+插件版本 `3.11.0`，需要 AstrBot `>=4.26.8`。本插件会把场景提示标记为临时内容，避免动态上下文被写入会话历史。
 
 ---
 
-# ⚠️ 安装后必须配置
+# 配置建议
 
-## 🚨 必须关闭框架内置的「群聊上下文感知」
+## 已开启框架内置「群聊上下文感知」时
 
-**安装本插件后，如果不关闭框架内置功能，会导致：**
+AstrBot 的 `group_icl_enable` 默认关闭，无需修改。若此前已开启，可关闭以避免：
 - LLM 收到两份群聊记录
 - 上下文快速膨胀
-- Token 消耗翻倍
+- 重复输入增加 Token 消耗与费用
 - 可能触发上下文溢出
 
 ### 关闭方法
@@ -162,7 +94,7 @@ ruff check .
 **方法二：配置文件**
 ```yaml
 provider_ltm_settings:
-  group_icl_enable: false  # 必须设为 false！
+  group_icl_enable: false  # 避免重复注入群聊场景
 ```
 
 ---
@@ -214,7 +146,7 @@ provider_settings:
 | LLM 请求图片压缩 | ✅ 可选、可调 | ✅ 全局配置 |
 | 注入位置 | 用户消息 | 系统提示词 |
 
-**本插件可完全替代框架内置 LTM 的群聊记录功能，且功能更强大。**
+本插件提供短期场景预览：用户消息最多保留 500 字，Bot 回复最多保留 200 字；完整聊天历史仍由 AstrBot 管理。
 
 ---
 
@@ -285,7 +217,7 @@ provider_settings:
 
 **注意**：启用图像转述后，每张图片会调用一次 LLM，会产生额外费用和延迟。
 
-`show_recent_images_allow_gif` 控制 `<recent_images>` 场景区块、图像转述及按需看图索引中的 GIF，不会删除 AstrBot Core 已持久化的会话图片。启用 `llm_image_compress` 后，历史 GIF 会在发送给模型前转换为首帧 PNG，并以自包含 `data URI` 进入本次请求；已经失效的历史本地图片引用会被安全移除，不影响同轮文本和其他图片。
+`show_recent_images_allow_gif` 控制 `<recent_images>` 场景区块、图像转述及按需看图索引中的 GIF，不会删除 AstrBot Core 已持久化的会话图片。历史 GIF 按 `gif_mode` 生成网格、独立帧或首帧，以自包含 `data URI` 进入本次请求；已经失效的历史本地图片引用会被安全移除，不影响同轮文本和其他图片。
 
 ### LLM 请求图片压缩
 
@@ -307,7 +239,7 @@ provider_settings:
 
 - 引用链中的图片 `File` 会在 Core 构建请求前按真实内容识别并转换, 不依赖扩展名。
 - 文件达到体积阈值, 或最长边超过 `max_edge` 时才压缩。
-- 普通静态图输出 JPEG; 带透明通道的图片保持 PNG; GIF 提取首帧并输出 PNG, 其他动图保持原样。
+- 普通静态图输出 JPEG，带透明通道的图片保持 PNG；GIF 按 `gif_mode` 处理，默认多帧网格。
 - 输出超过目标大小时, 先逐步降低 JPEG 质量, 再逐步缩小分辨率。
 - 下载或压缩失败时保留原引用, 不会阻断正常对话。
 
@@ -389,3 +321,12 @@ provider_settings:
 本插件开发QQ群：215532038
 
 <img width="400" alt="QQ群二维码" src="https://github.com/user-attachments/assets/113ccf60-044a-47f3-ac8f-432ae05f89ee" />
+
+### 开发接口（API v1）
+
+- `get_image_catalog(event)`：当前会话请求快照中的目录。
+- `resolve_reference_images(event, image_ids)`：校验当前快照和 epoch，全部成功才返回 bytes、SHA256 与来源；最多 8 张、单图 20 MiB、合计 64 MiB，独立于聊天看图上限。
+- `capture_image_request(event, conversation_id)`：任务开始前捕获实例与会话凭据。
+- `register_generated_image(receipt, task_id=..., data=..., parent_ids=...)`：已成功交付单图的短期登记；重复任务只能幂等返回同一内容，不能覆盖已公开 ID。
+
+可在真实 AstrBot 环境运行 `python tests/verify_two_plugin_bridge.py /path/to/context_plugin /path/to/gitee_plugin`，验证预处理清理、跨用户取图、任务输入副本、自拍参考与结果接续。该集成使用替代的生图/发送函数，不会向群发图或调用付费生图。

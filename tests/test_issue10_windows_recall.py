@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from image_context import SNAPSHOT_KEY, ImageIndex, _local_image_path
 from test_gemini_stt_context import FakeContext, FakeEvent, load_plugin_module
@@ -85,7 +85,7 @@ class WindowsRecallTests(unittest.IsolatedAsyncioTestCase):
             plugin = mod.Main(FakeContext(), {
                 "image_cache_dir": directory, "image_recall_auto": False,
             })
-            plugin._recall_supports_vision = lambda event: True
+            plugin._recall_supports_vision = AsyncMock(return_value=True)
             try:
                 for i, (source, expected) in enumerate((
                     ("file:///C:/images/test%20image.png", r"C:\images\test image.png"),
@@ -145,7 +145,7 @@ class WindowsRecallTests(unittest.IsolatedAsyncioTestCase):
                 "image_cache_dir": directory, "image_download_max_bytes": 32,
                 "image_recall_auto": False,
             })
-            plugin._recall_supports_vision = lambda event: True
+            plugin._recall_supports_vision = AsyncMock(return_value=True)
             try:
                 for i, source in enumerate(("missing.png", "file:///C:/bad%00.png", "large.png", "broken.png")):
                     if source == "large.png":

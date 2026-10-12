@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.10.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.11.0 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -91,7 +91,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.10.0
+Version: 3.11.0
 """
 
 from __future__ import annotations
@@ -127,12 +127,12 @@ from PIL import Image as PILImage
 try:
     from .gif_frames import GifOptions, prepare_gif
     from .model_capability import detect_video_capability
-    from .video_input import MainVideoAdapter, RecentVideos, VideoOptions, VideoResult, downloaded_video_paths, is_video_component, understand_video, video_source, walk_message_chain, UNPARSED
+    from .video_input import MainVideoAdapter, RecentVideos, VideoOptions, VideoResult, VideoProviderError, downloaded_video_paths, is_video_component, understand_video, video_source, walk_message_chain, UNPARSED
     from .audio_transcribe import AudioTranscriber
 except ImportError:
     from gif_frames import GifOptions, prepare_gif
     from model_capability import detect_video_capability
-    from video_input import MainVideoAdapter, RecentVideos, VideoOptions, VideoResult, downloaded_video_paths, is_video_component, understand_video, video_source, walk_message_chain, UNPARSED
+    from video_input import MainVideoAdapter, RecentVideos, VideoOptions, VideoResult, VideoProviderError, downloaded_video_paths, is_video_component, understand_video, video_source, walk_message_chain, UNPARSED
     from audio_transcribe import AudioTranscriber
 
 try:
@@ -692,19 +692,28 @@ class SessionManager:
                 summary_message_count=state.summary_message_count,
             )
 
-    async def mark_compressing_async(self, session_id: str) -> bool:
+    async def mark_compressing_async(self, session_id: str):
         """尝试标记会话正在压缩（避免并发重复压缩）。成功返回 True。"""
         async with self._get_lock(session_id):
-            state = await self._get_or_create_session(session_id)
-            if state.compressing:
-                return False
+            state = self._sessions.get(session_id)
+            if state is None or state.compressing:
+                return None
             state.compressing = True
-            return True
+            return state, SessionSnapshot(
+                messages=list(state.messages),
+                bot_last_spoke_at=state.bot_last_spoke_at,
+                bot_last_content=state.bot_last_content,
+                bot_last_replied_to=state.bot_last_replied_to,
+                bot_last_replied_to_name=state.bot_last_replied_to_name,
+                summary=state.summary,
+                summary_updated_at=state.summary_updated_at,
+                summary_message_count=state.summary_message_count,
+            )
 
-    async def clear_compressing_async(self, session_id: str) -> None:
+    async def clear_compressing_async(self, session_id: str, token) -> None:
         async with self._get_lock(session_id):
-            if session_id in self._sessions:
-                self._sessions[session_id].compressing = False
+            if self._sessions.get(session_id) is token:
+                token.compressing = False
 
     async def set_summary_and_trim_async(
         self,
@@ -714,20 +723,33 @@ class SessionManager:
         keep_recent: int,
         summarized_count: int,
         updated_at: float,
-    ) -> None:
+        token,
+        summarized_messages: list[MessageRecord],
+    ) -> SessionSnapshot | None:
         """设置摘要并裁剪历史（带会话锁）"""
         keep_recent = max(5, keep_recent)
         async with self._get_lock(session_id):
-            state = await self._get_or_create_session(session_id)
-            msgs = list(state.messages)
-            recent = msgs[-keep_recent:] if msgs else []
+            state = self._sessions.get(session_id)
+            if state is not token:
+                return None
+            summarized_ids = {id(message) for message in summarized_messages}
+            recent = [m for m in state.messages if id(m) not in summarized_ids]
             state.messages = deque(recent, maxlen=state.messages.maxlen)
             state.summary = summary
             state.summary_updated_at = updated_at
             state.summary_message_count = max(
                 state.summary_message_count, summarized_count
             )
-            state.compressing = False
+            return SessionSnapshot(
+                messages=list(state.messages),
+                bot_last_spoke_at=state.bot_last_spoke_at,
+                bot_last_content=state.bot_last_content,
+                bot_last_replied_to=state.bot_last_replied_to,
+                bot_last_replied_to_name=state.bot_last_replied_to_name,
+                summary=state.summary,
+                summary_updated_at=state.summary_updated_at,
+                summary_message_count=state.summary_message_count,
+            )
 
     async def remove_session_async(self, session_id: str) -> int:
         """移除整个会话（用于 reset/new/switch 等清空场景）"""
@@ -1592,6 +1614,11 @@ class Main(ImageReferenceAPI, star.Star):
         )
         self._gif_options = GifOptions.from_mapping(self._config)
         self._video_options = VideoOptions.from_mapping(self._config)
+        self._recent_status = OrderedDict()
+        if self._video_options.enabled:
+            for binary, purpose in (('ffprobe', '视频时长检查'), ('ffmpeg', '抽帧、转码和声音提取')):
+                if not shutil.which(binary):
+                    logger.warning(f'[ContextAware] 缺少 {binary}，{purpose}需要它；请安装到 AstrBot 运行环境。')
         self._video_adapters = {}
         self._recent_videos = RecentVideos()
         self._audio_transcriber = AudioTranscriber(self._context, self._config)
@@ -1681,7 +1708,7 @@ class Main(ImageReferenceAPI, star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.10.0"
+        version = "3.11.0"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -1861,7 +1888,47 @@ class Main(ImageReferenceAPI, star.Star):
 
     @staticmethod
     def _is_topic_inspect(event):
-        return str(event.get_message_str() or "").strip() in {"短期记忆", "/短期记忆"}
+        return str(event.get_message_str() or "").strip() in {"短期记忆", "/短期记忆", '场景状态', '/场景状态'}
+
+    @filter.command('场景状态', priority=100)
+    async def show_context_status(self, event: AstrMessageEvent):
+        event.stop_event()
+        if not event.is_admin():
+            yield event.plain_result('此命令需要管理员权限。')
+            return
+        capability, _, _ = await self._media_capability(event)
+        stt = await self._audio_transcriber.available(event.unified_msg_origin)
+        lines = [
+            f'场景与话题增强：{self._cfg_bool("enable", True)}',
+            f'视频理解：{self._video_options.enabled}',
+            f'判定处理方式：{capability}',
+            f'STT 已选中：{stt}',
+            f'ffprobe：{bool(shutil.which("ffprobe"))}',
+            f'ffmpeg：{bool(shutil.which("ffmpeg"))}',
+            '本次请求工具集合：未记录',
+        ]
+        self._expire_status()
+        status = self._recent_status.get(event.unified_msg_origin)
+        if status:
+            lines.append(f"最近处理状态：{status[1]}；记录时间：{time.strftime('%H:%M:%S', time.localtime(status[0]))}")
+        if self._topic and event.is_private_chat():
+            cid = await self._context.conversation_manager.get_curr_conversation_id(event.unified_msg_origin)
+            status = await self._topic.status(event.unified_msg_origin, str(cid))
+            lines.append(f"私聊摘要错误：{status[0] or '无'}；下次尝试时间：{status[1]}")
+        yield event.plain_result('\n'.join(lines))
+
+    def _expire_status(self):
+        now = time.time()
+        for origin, (created, _) in list(self._recent_status.items()):
+            if now - created > 600:
+                self._recent_status.pop(origin, None)
+
+    def _remember_status(self, origin, reason):
+        self._expire_status()
+        self._recent_status[origin] = (time.time(), reason)
+        self._recent_status.move_to_end(origin)
+        while len(self._recent_status) > 100:
+            self._recent_status.popitem(last=False)
 
     @filter.command("短期记忆", priority=100)
     async def show_short_term_memory(self, event: AstrMessageEvent):
@@ -1963,6 +2030,7 @@ class Main(ImageReferenceAPI, star.Star):
     ) -> None:
         self._image_index.clear(event.unified_msg_origin)
         self._recent_videos.sessions.pop(event.unified_msg_origin, None)
+        self._recent_status.pop(event.unified_msg_origin, None)
         removed = await self._sessions.remove_session_async(event.unified_msg_origin)
         if removed:
             logger.info(
@@ -2000,15 +2068,12 @@ class Main(ImageReferenceAPI, star.Star):
             "建议关闭 provider_ltm_settings.group_icl_enable，避免重复注入群聊历史。"
         )
 
-    def _ensure_initialized(self, event: AstrMessageEvent) -> bool:
+    def _ensure_initialized(self, event: AstrMessageEvent) -> SceneAnalyzer | None:
         """确保组件已初始化"""
-        if self._analyzer is not None:
-            return True
-
-        self._bot_id = event.get_self_id()
-        if not self._bot_id:
+        bot_id = event.get_self_id()
+        if not bot_id:
             logger.warning("[ContextAware] 无法获取 Bot ID，跳过处理")
-            return False
+            return None
 
         bot_names_raw = self._cfg("bot_names", [])
         bot_names: list[str] = []
@@ -2018,20 +2083,18 @@ class Main(ImageReferenceAPI, star.Star):
         # v3.0.0: 支持自定义回复特征词
         custom_starters = self._cfg_list("reply_starters", None)
         reply_starters = frozenset(custom_starters) if custom_starters else None
-        astrbot_config = self._context.get_config()
+        astrbot_config = self._context.get_config(umo=event.unified_msg_origin)
         wake_prefixes_raw = (
             astrbot_config.get("wake_prefix", []) if astrbot_config else []
         )
         wake_prefixes = [str(prefix) for prefix in wake_prefixes_raw if prefix]
 
-        self._analyzer = SceneAnalyzer(
-            bot_id=self._bot_id,
+        return SceneAnalyzer(
+            bot_id=bot_id,
             bot_names=bot_names,
             reply_starters=reply_starters,
             wake_prefixes=wake_prefixes,
         )
-        logger.info(f"[ContextAware] 初始化完成，Bot ID: {self._bot_id}")
-        return True
 
     # -------------------------------------------------------------------------
     # History Compression (Optional)
@@ -2047,11 +2110,11 @@ class Main(ImageReferenceAPI, star.Star):
             "min_interval_sec": self._cfg_int("history_compress_min_interval_sec", 300),
             "provider_id": str(self._cfg("history_compress_provider_id", "") or ""),
             "instruction": str(self._cfg("history_compress_instruction", "") or ""),
-            "timeout_sec": float(self._cfg_int("history_compress_timeout", 60)),
-            "max_input_chars": self._cfg_int("history_compress_max_input_chars", 5000),
-            "max_summary_chars": self._cfg_int(
+            "timeout_sec": float(max(1, self._cfg_int("history_compress_timeout", 60))),
+            "max_input_chars": max(1, self._cfg_int("history_compress_max_input_chars", 5000)),
+            "max_summary_chars": max(4, self._cfg_int(
                 "history_compress_max_summary_chars", 800
-            ),
+            )),
         }
 
     def _build_summary_input(self, msgs: list[MessageRecord], *, max_chars: int) -> str:
@@ -2083,6 +2146,10 @@ class Main(ImageReferenceAPI, star.Star):
 
         trigger_count = max(10, int(cfg["trigger_count"]))
         keep_recent = max(5, int(cfg["keep_recent"]))
+        if max(trigger_count, keep_recent + 6) > self._sessions._max_messages:
+            logger.warning('[ContextAware] 摘要阈值不可达，请增大 max_history 或降低保留条数与触发条数')
+            self._remember_status(umo, "summary_unreachable")
+            return snapshot
         if (
             len(snapshot.messages) < trigger_count
             or len(snapshot.messages) <= keep_recent + 5
@@ -2096,10 +2163,21 @@ class Main(ImageReferenceAPI, star.Star):
             return snapshot
 
         # 避免同一会话并发重复压缩
-        if not await self._sessions.mark_compressing_async(umo):
+        if self._history_compress_semaphore.locked():
+            logger.debug('[ContextAware] summary skipped: busy')
+            self._remember_status(umo, "summary_busy")
             return snapshot
+        started = await self._sessions.mark_compressing_async(umo)
+        if started is None:
+            return snapshot
+        token, snapshot = started
+
+        def valid_snapshot():
+            return snapshot if self._sessions._sessions.get(umo) is token else SessionSnapshot([], 0, "", "", "", "", 0, 0)
 
         try:
+            if self._history_compress_semaphore.locked():
+                return valid_snapshot()
             async with self._history_compress_semaphore:
                 provider: Provider | None = None
                 provider_id = str(cfg["provider_id"] or "")
@@ -2108,13 +2186,12 @@ class Main(ImageReferenceAPI, star.Star):
                     if isinstance(p, Provider):
                         provider = p
                 else:
-                    p = self._context.get_using_provider(umo)
+                    p = await self._using_provider(umo)
                     if isinstance(p, Provider):
                         provider = p
 
                 if not provider:
-                    await self._sessions.clear_compressing_async(umo)
-                    return snapshot
+                    return valid_snapshot()
 
                 instruction = cfg["instruction"].strip()
                 if not instruction:
@@ -2126,8 +2203,14 @@ class Main(ImageReferenceAPI, star.Star):
                     )
 
                 to_summarize = snapshot.messages[:-keep_recent]
+                max_input = max(1, int(cfg["max_input_chars"]))
+                # Only commit records actually included in the bounded prompt.
+                while to_summarize and len(self._build_summary_input(to_summarize, max_chars=10**9)) > max_input:
+                    to_summarize = to_summarize[:-1]
+                if not to_summarize:
+                    return valid_snapshot()
                 input_text = self._build_summary_input(
-                    to_summarize, max_chars=int(cfg["max_input_chars"])
+                    to_summarize, max_chars=max_input
                 )
 
                 prompt_parts = []
@@ -2150,34 +2233,39 @@ class Main(ImageReferenceAPI, star.Star):
                         timeout=float(cfg["timeout_sec"]),
                     )
                 except asyncio.TimeoutError:
-                    await self._sessions.clear_compressing_async(umo)
-                    return snapshot
+                    logger.warning('[ContextAware] summary skipped: timeout')
+                    if self._sessions._sessions.get(umo) is token:
+                        self._remember_status(umo, "summary_timeout")
+                    return valid_snapshot()
 
                 if not resp or not resp.completion_text:
-                    await self._sessions.clear_compressing_async(umo)
-                    return snapshot
+                    return valid_snapshot()
 
                 summary = resp.completion_text.strip()
+                if not summary:
+                    return valid_snapshot()
                 max_summary_chars = int(cfg["max_summary_chars"])
                 if len(summary) > max_summary_chars:
                     summary = summary[: max_summary_chars - 3] + "..."
 
-                await self._sessions.set_summary_and_trim_async(
+                committed = await self._sessions.set_summary_and_trim_async(
                     umo,
                     summary=summary,
                     keep_recent=keep_recent,
                     summarized_count=snapshot.summary_message_count + len(to_summarize),
                     updated_at=now,
+                    token=token,
+                    summarized_messages=to_summarize,
                 )
 
-                return await self._sessions.get_snapshot_async(umo)
+                return committed or SessionSnapshot([], 0, '', '', '', '', 0, 0)
         except asyncio.CancelledError:
-            await self._sessions.clear_compressing_async(umo)
             raise
         except Exception as e:
-            logger.error(f"[ContextAware] 历史压缩失败: {e}")
-            await self._sessions.clear_compressing_async(umo)
-            return snapshot
+            logger.error(f"[ContextAware] 历史压缩失败: {type(e).__name__}")
+            return valid_snapshot()
+        finally:
+            await self._sessions.clear_compressing_async(umo, token)
 
     def _mark_url_failed(self, cache_key: str) -> None:
         """缓存失败的URL（用空字符串作为哨兵），避免后续对同一URL重复请求"""
@@ -2827,7 +2915,7 @@ class Main(ImageReferenceAPI, star.Star):
         except Exception:
             return
 
-        allow_gif = self._media_capability(event)[0] != "none"
+        allow_gif = (await self._media_capability(event))[0] != "none"
         for chain, index, component in walk_message_chain(messages):
             if isinstance(component, File) and chain is not messages and not is_video_component(component):
                 try:
@@ -2876,7 +2964,7 @@ class Main(ImageReferenceAPI, star.Star):
         Returns:
             None.
         """
-        no_vision = self._media_capability(event, req)[0] == "none"
+        no_vision = (await self._media_capability(event, req))[0] == "none"
         gif_notes = {
             note for _, note in (event.get_extra("_context_aware_gif_expansions", None) or {}).values()
             if note
@@ -3087,7 +3175,13 @@ class Main(ImageReferenceAPI, star.Star):
             event.get_extra("_context_aware_gif_expansions", None) or {}
         ).values())
 
-    def _request_provider(self, event, req=None):
+    async def _using_provider(self, umo=None):
+        getter = getattr(self._context, 'get_using_provider_async', None)
+        if callable(getter):
+            return await getter(umo=umo)
+        return self._context.get_using_provider(umo=umo) if umo else self._context.get_using_provider()
+
+    async def _request_provider(self, event, req=None):
         try:
             # Core's event selection and an explicit request provider take priority.
             provider = getattr(req, "provider", None)
@@ -3096,12 +3190,12 @@ class Main(ImageReferenceAPI, star.Star):
             provider_id = getattr(req, "provider_id", None) or getattr(req, "chat_provider_id", None) or event.get_extra("selected_provider", None)
             if provider_id:
                 return self._context.get_provider_by_id(provider_id)
-            return self._context.get_using_provider(umo=event.unified_msg_origin)
+            return await self._using_provider(event.unified_msg_origin)
         except Exception:
             return None
 
-    def _media_capability(self, event, req=None):
-        provider = self._request_provider(event, req)
+    async def _media_capability(self, event, req=None):
+        provider = await self._request_provider(event, req)
         config = getattr(provider, "provider_config", {}) or {}
         model = getattr(req, "model", None) or event.get_extra("selected_model", None)
         if not model:
@@ -3158,12 +3252,41 @@ class Main(ImageReferenceAPI, star.Star):
                 at_bot = any(isinstance(c, At) and str(c.qq) == str(event.get_self_id()) for c in messages)
             except Exception:
                 at_bot = False
-            if at_bot:
+            question = str(getattr(req, 'prompt', '') or '')
+            media = r'(?:视频|短片|片段|画面|video|clip)'
+            denied = re.search(
+                rf"(?:不要|别|不用|无需|不必).{{0,12}}(?:{media}|看|观看|分析|解读)"
+                r"|\b(?:do not|don't|never)\b.{0,30}\b(?:video|clip|watch|analyze|view)\b",
+                question, re.IGNORECASE,
+            )
+            # Operational questions do not require reading a historical video.
+            operation = r'(?:压缩|剪辑|裁剪|转码|转换格式|转格式|导出|下载|上传|编辑)'
+            operational = re.search(
+                rf'(?:怎么|怎样|如何|用什么|用哪个|用哪种|软件|工具).{{0,30}}{operation}'
+                rf'|{operation}.{{0,30}}(?:怎么|怎样|如何|软件|工具|方法|教程)'
+                r'|\b(?:how\s+(?:to|do|can|should)|software|tool|app)\b.{0,60}'
+                r'\b(?:compress|edit|trim|convert|download|upload|export)\b'
+                r'|\b(?:compress|edit|trim|convert|download|upload|export)\b.{0,60}'
+                r'\b(?:software|tool|app|tutorial)\b',
+                question, re.IGNORECASE,
+            )
+            video_intent = not denied and not operational and bool(re.search(
+                rf'(?:这|那|刚才|刚刚|上面|前面|之前|上一条).{{0,4}}{media}'
+                rf'|{media}(?:里|中|里面|当中|的内容)'
+                r'|说了什么|讲了什么|唱了什么|什么声音|什么歌|发生了什么'
+                r'|\b(?:this|that|previous|last)\s+(?:video|clip)\b',
+                question, re.IGNORECASE,
+            ))
+            if at_bot and video_intent:
                 message_id = str(getattr(getattr(event, "message_obj", None), "message_id", "") or id(event))
                 components = self._recent_videos.latest(event.unified_msg_origin, message_id)
+                components = list({video_source(c) or id(c): c for c in components}.values())
+                if len(components) > 1:
+                    self._inject_scene(req, '最近有多个视频，请让用户引用要讨论的视频。')
+                    return
         if not components:
             return
-        capability, provider, model = self._media_capability(event, req)
+        capability, provider, model = await self._media_capability(event, req)
         adapter = self._main_video_adapter(provider) if capability != "none" else None
         # A request model/provider switch must not reuse another model's decision.
         cache_key = (id(provider), model, capability, bool(adapter))
@@ -3197,7 +3320,11 @@ class Main(ImageReferenceAPI, star.Star):
                             transcriber=self._audio_transcriber, origin=event.unified_msg_origin,
                         )
                     results.append(result)
+                    if self._image_index.is_current(event.unified_msg_origin, event.get_extra(EPOCH_KEY)):
+                        self._remember_status(event.unified_msg_origin, "video_" + result.reason)
                 except asyncio.CancelledError:
+                    raise
+                except VideoProviderError:
                     raise
                 except Exception as exc:
                     logger.warning(f"[ContextAware] 视频预处理失败: {type(exc).__name__}")
@@ -3240,6 +3367,20 @@ class Main(ImageReferenceAPI, star.Star):
         """获取图片描述（v3.0.0: 并发限流 + 超时 + 缓存）"""
         if not self._image_caption_enabled:
             return None
+        try:
+            provider = (
+                self._context.get_provider_by_id(self._image_caption_provider_id)
+                if self._image_caption_provider_id
+                else await self._using_provider()
+            )
+            if not isinstance(provider, Provider):
+                return None
+            provider_config = getattr(provider, "provider_config", {}) or {}
+            getter = getattr(provider, "get_model", None)
+            model = getter() if callable(getter) else provider_config.get("model", "")
+        except Exception as exc:
+            logger.warning(f"[ContextAware] 图像转述模型查询失败: {type(exc).__name__}")
+            return None
 
         # data URI 处理（v3.3.1: 修复 issue #1 [Errno 36] File name too long）：
         # 平台（如 NapCat QQ）有时直接传入 base64 data URI 而非 URL。
@@ -3255,6 +3396,8 @@ class Main(ImageReferenceAPI, star.Star):
                 effective_url = self._local_path_to_data_uri(local_path) or image_url
             # 若无缓存目录则 effective_url 保持原始 data URI，由 provider 自行处理
 
+        cache_key = (cache_key, provider_config.get('id', self._image_caption_provider_id),
+                     str(model), hashlib.sha256(self._image_caption_prompt.encode('utf-8')).hexdigest())
         # 缓存命中检查：空字符串为失败哨兵，同时检查 TTL
         if cache_key in self._image_caption_cache:
             cached_value, cached_at = self._image_caption_cache[cache_key]
@@ -3270,25 +3413,6 @@ class Main(ImageReferenceAPI, star.Star):
             # 并发限流
             async with self._image_caption_semaphore:
                 # 获取 provider
-                provider = None
-                if self._image_caption_provider_id:
-                    provider = self._context.get_provider_by_id(
-                        self._image_caption_provider_id
-                    )
-                    if not provider:
-                        logger.warning(
-                            f"[ContextAware] 找不到指定的图像转述提供商: {self._image_caption_provider_id}"
-                        )
-                        return None
-                else:
-                    provider = self._context.get_using_provider()
-
-                if not provider or not isinstance(provider, Provider):
-                    logger.warning(
-                        "[ContextAware] 无法获取有效的 Provider 进行图像转述"
-                    )
-                    return None
-
                 caption_images = [effective_url]
                 caption_prompt = self._image_caption_prompt
                 local = await self._materialize_image_for_compression(effective_url)
@@ -3346,7 +3470,7 @@ class Main(ImageReferenceAPI, star.Star):
                     ):
                         self._image_caption_cache.popitem(last=False)
                     logger.info(
-                        f"[ContextAware] 图像转述完成 ({elapsed:.1f}s) | {caption[:40]}..."
+                        f"[ContextAware] 图像转述完成 ({elapsed:.1f}s), 长度 {len(caption)}"
                     )
                     return caption
 
@@ -3443,10 +3567,11 @@ class Main(ImageReferenceAPI, star.Star):
         return updated
 
     async def _extract_message_with_caption(
-        self, event: AstrMessageEvent
+        self, event: AstrMessageEvent, analyzer: SceneAnalyzer | None = None
     ) -> MessageRecord:
         """从事件提取消息记录，支持图像转述"""
-        assert self._analyzer is not None
+        analyzer = analyzer or self._ensure_initialized(event)
+        assert analyzer is not None
 
         sender_id = event.get_sender_id()
         parts: list[str] = []
@@ -3518,7 +3643,7 @@ class Main(ImageReferenceAPI, star.Star):
             sender_name=event.get_sender_name() or sender_id,
             content=content[:500],
             timestamp=time.time(),
-            is_bot=(sender_id == self._analyzer.bot_id),
+            is_bot=(sender_id == analyzer.bot_id),
             message_outline=message_outline,
             has_image=has_image,
             image_count=max(image_count, 1 if has_image else 0),
@@ -3536,10 +3661,10 @@ class Main(ImageReferenceAPI, star.Star):
                 qq_str = str(comp.qq)
                 msg.at_targets.append(
                     _normalize_at_target(
-                        self._analyzer.bot_id, qq_str, comp.name or qq_str
+                        analyzer.bot_id, qq_str, comp.name or qq_str
                     )
                 )
-                if qq_str == self._analyzer.bot_id:
+                if qq_str == analyzer.bot_id:
                     msg.at_bot = True
                 elif qq_str == "all":
                     msg.at_all = True
@@ -3580,9 +3705,9 @@ class Main(ImageReferenceAPI, star.Star):
             await self._image_index.retain_local(ids)
             self._image_index.prefetch(ids)
 
-    def _recall_supports_vision(self, event: AstrMessageEvent) -> bool:
+    async def _recall_supports_vision(self, event: AstrMessageEvent) -> bool:
         try:
-            provider = self._request_provider(event, event.get_extra("provider_request", None))
+            provider = await self._request_provider(event, event.get_extra("provider_request", None))
             if not provider:
                 return False
             modalities = provider.provider_config.get("modalities")
@@ -3635,7 +3760,7 @@ class Main(ImageReferenceAPI, star.Star):
                     "该目录在本次请求准备时固定；若旧 id 不在目录中，不要假装仍可访问。批量生成工具尚不支持历史参考ID，不得省略参考后改走批量生成。"
                 )
             self._inject_scene(req, instructions)
-        if not self._recall_supports_vision(event):
+        if not await self._recall_supports_vision(event):
             return
         native_images = bool(getattr(req, "image_urls", None)) or any(
             getattr(p, "type", "") == "image_url"
@@ -3654,7 +3779,7 @@ class Main(ImageReferenceAPI, star.Star):
             payload = await asyncio.wait_for(
                 self._image_index.read(
                     event.unified_msg_origin, selected.image_id, all_frames=True,
-                    capability=self._media_capability(event, req)[0],
+                    capability=(await self._media_capability(event, req))[0],
                 ),
                 timeout=2,
             )
@@ -3707,7 +3832,7 @@ class Main(ImageReferenceAPI, star.Star):
 
         if not self._should_process(event) or not self._recall_enabled:
             return text_result("本会话的上下文看图未启用。")
-        if not self._recall_supports_vision(event):
+        if not await self._recall_supports_vision(event):
             return text_result(
                 "当前模型未配置视觉能力，不能查看图片；不要猜测图片内容。"
             )
@@ -3751,7 +3876,7 @@ class Main(ImageReferenceAPI, star.Star):
                     continue
                 payload = await self._image_index.read(
                     event.unified_msg_origin, image_id, detail, all_frames=True,
-                    capability=self._media_capability(event, event.get_extra("provider_request", None))[0],
+                    capability=(await self._media_capability(event, event.get_extra("provider_request", None)))[0],
                 )
                 resource = self._image_index.get(event.unified_msg_origin, image_id)
                 if payload is None or resource is None:
@@ -3816,16 +3941,15 @@ class Main(ImageReferenceAPI, star.Star):
         if not has_content:
             return
 
-        if not self._ensure_initialized(event):
+        analyzer = self._ensure_initialized(event)
+        if analyzer is None:
             return
 
-        assert self._analyzer is not None
-
         # 使用支持图像转述的方法提取消息
-        msg = await self._extract_message_with_caption(event)
+        msg = await self._extract_message_with_caption(event, analyzer)
         await self._record_recall_images(event, msg)
         snapshot = await self._sessions.get_snapshot_async(event.unified_msg_origin)
-        inference_reason = self._analyzer.infer_addressee(
+        inference_reason = analyzer.infer_addressee(
             msg,
             snapshot.messages,
             bot_replied_to=snapshot.bot_last_replied_to,
@@ -3883,6 +4007,18 @@ class Main(ImageReferenceAPI, star.Star):
             logger.debug(f"[ContextAware] Removed {removed} previous recall image(s)")
         try:
             await self._prepare_request_videos(event, req)
+        except VideoProviderError:
+            # Core swallows hook exceptions; stop before attempting feedback.
+            event.stop_event()
+            self._remember_status(event.unified_msg_origin, "video_provider_error")
+            logger.warning("[ContextAware] 视频服务调用失败，已停止本次请求")
+            try:
+                await event.send(event.plain_result(
+                    "视频服务调用失败，请稍后重试或联系管理员检查模型服务。"
+                ))
+            except Exception:
+                logger.warning("[ContextAware] 视频服务失败提示发送失败")
+            return
         except Exception as exc:
             logger.warning(f"[ContextAware] 视频请求准备失败: {type(exc).__name__}")
             self._inject_scene(req, UNPARSED)
@@ -3895,10 +4031,10 @@ class Main(ImageReferenceAPI, star.Star):
         if not self._should_process(event):
             return
 
-        if not self._ensure_initialized(event):
+        analyzer = self._ensure_initialized(event)
+        if analyzer is None:
             return
 
-        assert self._analyzer is not None
         self._warn_if_builtin_ltm_enabled(event)
 
         umo = event.unified_msg_origin
@@ -3906,7 +4042,7 @@ class Main(ImageReferenceAPI, star.Star):
             event.get_extra(ExtraKeys.CURRENT_MESSAGE_RECORD), MessageRecord
         ):
             # 使用支持图像转述的方法
-            msg = await self._extract_message_with_caption(event)
+            msg = await self._extract_message_with_caption(event, analyzer)
             await self._record_recall_images(event, msg)
             event.set_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, msg)
             added = await self._sessions.add_message_async(umo, msg)
@@ -3976,6 +4112,8 @@ class Main(ImageReferenceAPI, star.Star):
             )
             if snapshot2 is not snapshot:
                 snapshot = snapshot2
+                if not snapshot.messages:
+                    return
                 flow_source = snapshot.messages
                 if not is_poke_trigger:
                     try:
@@ -3992,7 +4130,7 @@ class Main(ImageReferenceAPI, star.Star):
                     except Exception:
                         pass
 
-            trigger_type, trigger_desc = self._analyzer.detect_trigger(event, current)
+            trigger_type, trigger_desc = analyzer.detect_trigger(event, current)
             await self._prepare_image_recall(event, req, current, trigger_type)
 
             # v3.2.0: strict_mode 开启时，主动触发场景下强制 talking_to = "group"，
@@ -4133,7 +4271,7 @@ class Main(ImageReferenceAPI, star.Star):
 
         bot_msg = MessageRecord(
             msg_id=f"bot_{uuid.uuid4().hex[:12]}",
-            sender_id=self._bot_id or "bot",
+            sender_id=event.get_self_id() or "bot",
             sender_name="[你]",
             content=resp.completion_text[:200],
             timestamp=now,

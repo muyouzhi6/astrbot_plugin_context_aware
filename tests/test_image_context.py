@@ -358,7 +358,7 @@ class PluginToolTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.mod = load_plugin_module()
         self.plugin = self.mod.Main(FakeContext())
-        self.plugin._recall_supports_vision = lambda event: True
+        self.plugin._recall_supports_vision = AsyncMock(return_value=True)
         self.event = FakeEvent()
         self.ids = self.plugin._image_index.add(
             self.event.unified_msg_origin, message(), 1
@@ -408,7 +408,7 @@ class PluginToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(p.type == "image" for r in results for p in r.content), 2)
 
     async def test_non_visual_provider_never_claims_image_was_seen(self):
-        self.plugin._recall_supports_vision = lambda event: False
+        self.plugin._recall_supports_vision = AsyncMock(return_value=False)
         result = await self.plugin.context_aware_view_images(self.event, list(self.ids))
         self.assertEqual(result.content[0].type, "text")
         self.assertIn("未配置视觉能力", result.content[0].text)

@@ -8,6 +8,7 @@ import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -49,6 +50,7 @@ class Event:
 
 
 async def verify():
+    await verify_video_hook_failure()
     with tempfile.TemporaryDirectory() as temporary:
         provider = SimpleNamespace(
             provider_config={"id": "test", "modalities": ["text", "image", "tool_use"]}
@@ -234,6 +236,55 @@ async def verify():
                             Path(image_id).unlink(missing_ok=True)
         finally:
             await plugin.terminate()
+
+
+async def verify_video_hook_failure():
+    from astrbot.core.pipeline import context_utils
+    from astrbot.core.star.star_handler import EventType
+    from video_input import VideoProviderError
+    import main
+
+    plugin = Main(SimpleNamespace(), {})
+    try:
+        for status in (401, 429, 503):
+            for send_fails in (False, True):
+                raw = AstrBotMessage()
+                raw.type = MessageType.GROUP_MESSAGE
+                raw.self_id = 'bot'
+                raw.sender = MessageMember('u', 'User')
+                raw.message = []
+                raw.group_id = 'hook-test'
+                ev = AstrMessageEvent('', raw, PlatformMetadata('test', 'test', 'test'), 'hook-test')
+                ev.send = AsyncMock(side_effect=RuntimeError('private-send-body') if send_fails else None)
+                error = RuntimeError('private-upstream-body')
+                error.status_code = status
+                handler = SimpleNamespace(handler=plugin.on_llm_request, handler_module_path='hook-test', handler_name='on_llm_request')
+                main_request = AsyncMock()
+                with (
+                    patch.object(plugin, '_is_topic_inspect', return_value=False),
+                    patch.object(plugin, '_topic_request', new=AsyncMock()),
+                    patch.object(plugin, '_stamp_image_event'),
+                    patch.object(plugin, '_prepare_request_videos', new=AsyncMock(side_effect=VideoProviderError(error))) as prepare,
+                    patch.object(plugin, '_compress_provider_request_images', new=AsyncMock()) as compress,
+                    patch.object(context_utils.star_handlers_registry, 'get_handlers_by_event_type', return_value=[handler]),
+                    patch.dict(context_utils.star_map, {'hook-test': SimpleNamespace(name='ContextAware')}),
+                    patch.object(context_utils.logger, 'error') as logged_error,
+                    patch.object(main.logger, 'warning') as logged_warning,
+                ):
+                    stopped = await context_utils.call_event_hook(ev, EventType.OnLLMRequestEvent, ProviderRequest(prompt='video'))
+                    if not stopped:
+                        await main_request()
+                    assert stopped and ev.is_stopped()
+                    main_request.assert_not_awaited()
+                    compress.assert_not_awaited()
+                    prepare.assert_awaited_once()
+                    ev.send.assert_awaited_once()
+                    logged_error.assert_not_called()
+                    assert 'private-' not in str(logged_warning.call_args_list)
+                    assert 'private-' not in str(ev.send.call_args_list)
+        print('PASS real call_event_hook stops video service failures with sanitized feedback')
+    finally:
+        await plugin.terminate()
 
 
 if __name__ == "__main__":

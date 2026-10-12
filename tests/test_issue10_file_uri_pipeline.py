@@ -148,8 +148,8 @@ class WindowsImagePipelineTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.plugin._image_compress_output_dir = str(self.root / "compressed")
-        self.plugin._recall_supports_vision = lambda event: True
-        self.plugin._media_capability = lambda event, req=None: ("image", "test")
+        self.plugin._recall_supports_vision = AsyncMock(return_value=True)
+        self.plugin._media_capability = AsyncMock(return_value=("image", "test"))
         self.addAsyncCleanup(self.plugin.terminate)
         source = self.root / "source.jpg"
         with PILImage.effect_noise((1024, 768), 65).convert("RGB") as image:
