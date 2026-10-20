@@ -318,9 +318,9 @@ provider_settings:
 
 ---
 
-本插件开发QQ群：215532038
+本插件开发QQ群：木有知插件群 1105763429
 
-<img width="400" alt="QQ群二维码" src="https://github.com/user-attachments/assets/113ccf60-044a-47f3-ac8f-432ae05f89ee" />
+<img width="400" alt="木有知插件群二维码" src="assets/plugin_group_qr.jpg" />
 
 ### 开发接口（API v1）
 
