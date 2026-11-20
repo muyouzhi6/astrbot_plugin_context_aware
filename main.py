@@ -1,5 +1,5 @@
 """
-AstrBot 上下文场景感知增强插件 v3.11.0 (Context-Aware Enhancement)
+AstrBot 上下文场景感知增强插件 v3.11.1 (Context-Aware Enhancement)
 
 为 LLM 提供结构化的群聊场景描述，增强其对对话情境的理解能力。
 重点解决：主动回复时 Bot 误以为别人在问自己的问题。
@@ -91,7 +91,7 @@ v3.2.0 更新:
 - [CONFIG] 新增 strict_mode：开启后 TRIGGER_ACTIVE/UNKNOWN 场景强制不推断 talking_to=bot
 
 Author: 木有知
-Version: 3.11.0
+Version: 3.11.1
 """
 
 from __future__ import annotations
@@ -1157,11 +1157,29 @@ class SceneAnalyzer:
             if target_id != "bot"
         ]
         if non_bot_targets:
+            history_list = list(history) if isinstance(history, deque) else history
+            resolved_names: list[str] = []
+            resolved_by_id: dict[str, str] = {}
+            for target_id, target_name in non_bot_targets:
+                display_name = target_name
+                if not display_name or display_name == target_id:
+                    for m in reversed(history_list):
+                        if m.sender_id == target_id and m.sender_name:
+                            display_name = m.sender_name
+                            break
+                resolved_by_id[target_id] = display_name or target_id
+                resolved_names.append(resolved_by_id[target_id])
+            if msg.at_targets:
+                msg.at_targets = [
+                    (
+                        tid,
+                        resolved_by_id.get(tid, tname) if tid != "bot" else tname,
+                    )
+                    for tid, tname in msg.at_targets
+                ]
             target_id, _ = non_bot_targets[0]
             msg.talking_to = target_id
-            msg.talking_to_name = _format_name_list(
-                [target_name for _, target_name in non_bot_targets]
-            )
+            msg.talking_to_name = _format_name_list(resolved_names)
             return InferenceReason.RULE_2_AT_OTHER
 
         # ===== 规则3: 引用回复消息（高置信度）=====
@@ -1708,7 +1726,7 @@ class Main(ImageReferenceAPI, star.Star):
         self._image_compress_errors = 0
         self._image_compress_saved_bytes = 0
 
-        version = "3.11.0"
+        version = "3.11.1"
         caption_status = "已启用" if self._image_caption_enabled else "未启用"
         if self._image_caption_enabled and self._image_caption_lazy:
             caption_status += "（lazy 模式）"
@@ -3945,10 +3963,34 @@ class Main(ImageReferenceAPI, star.Star):
         if analyzer is None:
             return
 
+        existing = event.get_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, None)
+        if isinstance(existing, MessageRecord) and self._sessions.has_session(
+            event.unified_msg_origin
+        ):
+            return
+
+        _, added = await self._record_event_message(event, analyzer)
+
+        # 每记录 50 条消息输出一次统计
+        if added and self._stats.messages_recorded % 50 == 0:
+            caption_info = ""
+            if self._image_caption_enabled:
+                caption_info = f", 图像转述 {self._image_caption_count} 次"
+            logger.info(
+                f"[ContextAware] 统计: 已记录 {self._stats.messages_recorded} 条消息, "
+                f"已注入 {self._stats.scenes_injected} 次场景, "
+                f"活跃会话 {self._sessions.get_session_count()} 个{caption_info}"
+            )
+
+    async def _record_event_message(
+        self, event: AstrMessageEvent, analyzer: SceneAnalyzer
+    ) -> tuple[MessageRecord, bool]:
+        """提取消息、推断对话对象并写入会话历史。"""
+        umo = event.unified_msg_origin
         # 使用支持图像转述的方法提取消息
         msg = await self._extract_message_with_caption(event, analyzer)
         await self._record_recall_images(event, msg)
-        snapshot = await self._sessions.get_snapshot_async(event.unified_msg_origin)
+        snapshot = await self._sessions.get_snapshot_async(umo)
         inference_reason = analyzer.infer_addressee(
             msg,
             snapshot.messages,
@@ -3976,20 +4018,10 @@ class Main(ImageReferenceAPI, star.Star):
             )
 
         # v3.0.0: 使用异步方法确保并发安全
-        added = await self._sessions.add_message_async(event.unified_msg_origin, msg)
+        added = await self._sessions.add_message_async(umo, msg)
         if added:
             self._stats.messages_recorded += 1
-
-        # 每记录 50 条消息输出一次统计
-        if self._stats.messages_recorded % 50 == 0:
-            caption_info = ""
-            if self._image_caption_enabled:
-                caption_info = f", 图像转述 {self._image_caption_count} 次"
-            logger.info(
-                f"[ContextAware] 统计: 已记录 {self._stats.messages_recorded} 条消息, "
-                f"已注入 {self._stats.scenes_injected} 次场景, "
-                f"活跃会话 {self._sessions.get_session_count()} 个{caption_info}"
-            )
+        return msg, added
 
     @filter.on_llm_request(priority=-10)
     async def on_llm_request(
@@ -4041,13 +4073,7 @@ class Main(ImageReferenceAPI, star.Star):
         if not self._sessions.has_session(umo) or not isinstance(
             event.get_extra(ExtraKeys.CURRENT_MESSAGE_RECORD), MessageRecord
         ):
-            # 使用支持图像转述的方法
-            msg = await self._extract_message_with_caption(event, analyzer)
-            await self._record_recall_images(event, msg)
-            event.set_extra(ExtraKeys.CURRENT_MESSAGE_RECORD, msg)
-            added = await self._sessions.add_message_async(umo, msg)
-            if added:
-                self._stats.messages_recorded += 1
+            await self._record_event_message(event, analyzer)
 
         try:
             snapshot = await self._sessions.get_snapshot_async(umo)
